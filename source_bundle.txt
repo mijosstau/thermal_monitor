@@ -1,0 +1,4263 @@
+Source bundle for: /home/staud/Dokumente/embedded_bewerbung
+Files: 45
+
+====================================================================================================
+FILE: CMakeLists.txt
+====================================================================================================
+
+cmake_minimum_required(VERSION 3.16)
+project(ThermalSimulator VERSION 1.0 LANGUAGES C CXX)
+
+enable_testing()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+
+# ============================================================================
+# Core Library — pure C++, no Qt dependencies (usable on embedded targets)
+# ============================================================================
+add_library(ThermalMonitorCore STATIC
+    thermal_monitor.h  thermal_monitor.cpp
+    interfaces.h
+)
+target_include_directories(ThermalMonitorCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ============================================================================
+# GUI Application — Qt6 wrapper around core library
+# ============================================================================
+find_package(Qt6 QUIET COMPONENTS Core Widgets)
+if(NOT Qt6_FOUND)
+    find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
+    set(QT_MAJOR 5)
+else()
+    set(QT_MAJOR 6)
+endif()
+
+add_executable(ThermalSimulator
+    main.cpp
+    mainwindow.h mainwindow.cpp
+    c_impl/qt_adapter.hpp c_impl/qt_adapter.cpp
+)
+target_link_libraries(ThermalSimulator PRIVATE
+    ThermalMonitorCore
+    ThermalMonitorC
+    Qt${QT_MAJOR}::Core
+    Qt${QT_MAJOR}::Widgets
+)
+
+# ============================================================================
+# Tests — Google Test (no Qt dependencies)
+# ============================================================================
+option(BUILD_TESTS "Build unit tests with Google Test" ON)
+if(BUILD_TESTS)
+    find_package(GTest REQUIRED)
+
+    add_executable(thermal_monitor_tests
+        tests/thermal_monitor_test.cpp
+    )
+    target_link_libraries(thermal_monitor_tests PRIVATE
+        ThermalMonitorCore
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+    )
+
+    include(GoogleTest)
+    gtest_discover_tests(thermal_monitor_tests)
+endif()
+
+# ============================================================================
+# Real-hardware demo — uses RealLinuxOs with i2c-stub kernel module
+# ============================================================================
+add_executable(demo_real_hw demo_real_hw.cpp)
+target_link_libraries(demo_real_hw PRIVATE ThermalMonitorCore pthread)
+
+# ============================================================================
+# C Implementation (Spec requirement: C version with mocks)
+# ============================================================================
+add_subdirectory(c_impl)
+
+
+====================================================================================================
+FILE: README.md
+====================================================================================================
+
+# Thermal Monitor
+
+Embedded-style thermal monitor implemented in C and C++.
+
+Full project documentation is in [docs/README.md](docs/README.md).
+
+Architecture diagram: [docs/architecture.svg](docs/architecture.svg)
+
+Generated PDF documentation: [docs/README.pdf](docs/README.pdf)
+
+QEMU VM setup: [qemu/README.md](qemu/README.md)
+
+## Quick Start
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The build includes the C implementation, the C++ implementation, Qt simulator, mocks, unit tests, and real-Linux/QEMU demo targets.
+
+
+====================================================================================================
+FILE: c_impl/CMakeLists.txt
+====================================================================================================
+
+cmake_minimum_required(VERSION 3.16)
+
+# Qt AUTOMOC is set globally in the root; disable it for all C targets here
+set(CMAKE_AUTOMOC OFF)
+
+# ── Core C library ────────────────────────────────────────────────────────────
+add_library(ThermalMonitorC STATIC
+    thermal_monitor.h  thermal_monitor.c
+    interfaces.h
+)
+target_include_directories(ThermalMonitorC PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ThermalMonitorC PUBLIC pthread)
+
+# ── Linux hardware adapters ───────────────────────────────────────────────────
+add_library(ThermalMonitorCLinux STATIC
+    linux_adapters.h   linux_adapters.c
+)
+target_include_directories(ThermalMonitorCLinux PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ThermalMonitorCLinux PUBLIC ThermalMonitorC)
+
+add_executable(thermal_monitor_c_demo_real
+    demo_real_hw_c.c
+)
+target_link_libraries(thermal_monitor_c_demo_real PRIVATE
+    ThermalMonitorC
+    ThermalMonitorCLinux
+)
+
+# ── GTest suite (C++ test file linking against the C library) ─────────────────
+if(BUILD_TESTS)
+    find_package(GTest REQUIRED)
+
+    add_executable(thermal_monitor_c_tests
+        tests/thermal_monitor_c_test.cpp
+    )
+    target_include_directories(thermal_monitor_c_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_link_libraries(thermal_monitor_c_tests PRIVATE
+        ThermalMonitorC
+        GTest::gtest
+        GTest::gtest_main
+    )
+
+    include(GoogleTest)
+    gtest_discover_tests(thermal_monitor_c_tests)
+endif()
+
+
+====================================================================================================
+FILE: c_impl/demo_real_hw_c.c
+====================================================================================================
+
+#include "linux_adapters.h"
+#include "thermal_monitor.h"
+
+#include <fcntl.h>
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#define TEMP_REG 0x00
+
+static atomic_int g_last_temp;
+
+typedef struct {
+    CLinuxLikeOs base;
+    LinuxOs real;
+    const char* nvmem_path;
+} PatchedLinuxOs;
+
+static void on_temperature(int16_t temp_dC)
+{
+    atomic_store(&g_last_temp, temp_dC);
+}
+
+static bool write_file(const char* path, const void* data, size_t n)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror(path);
+        return false;
+    }
+    ssize_t written = write(fd, data, n);
+    close(fd);
+    return written == (ssize_t)n;
+}
+
+static bool setup_demo_fs(const char* nvmem_path)
+{
+    uint8_t type_a = 0x00;
+    if (!write_file(nvmem_path, &type_a, 1)) return false;
+    return true;
+}
+
+static void print_gpio(const char* label, const char* path)
+{
+    int value = linux_gpio_read_value(path);
+    printf("  %-8s = %d  (%s)\n", label, value, path);
+}
+
+static const char* translate_path(PatchedLinuxOs* os, const char* path)
+{
+    if (strcmp(path, "/sys/bus/nvmem/devices/eeprom0/nvmem") == 0)
+        return os->nvmem_path;
+    return path;
+}
+
+static int patched_open(CLinuxLikeOs* self, const char* path, COpenFlags flags)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.open((CLinuxLikeOs*)&os->real, translate_path(os, path), flags);
+}
+
+static ssize_t patched_read(CLinuxLikeOs* self, int fd, void* buf, size_t n)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.read((CLinuxLikeOs*)&os->real, fd, buf, n);
+}
+
+static ssize_t patched_write(CLinuxLikeOs* self, int fd, const void* buf, size_t n)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.write((CLinuxLikeOs*)&os->real, fd, buf, n);
+}
+
+static int patched_ioctl(CLinuxLikeOs* self, int fd, unsigned long request, void* arg)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.ioctl((CLinuxLikeOs*)&os->real, fd, request, arg);
+}
+
+static off_t patched_lseek(CLinuxLikeOs* self, int fd, off_t offset, int whence)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.lseek((CLinuxLikeOs*)&os->real, fd, offset, whence);
+}
+
+static int patched_close(CLinuxLikeOs* self, int fd)
+{
+    PatchedLinuxOs* os = (PatchedLinuxOs*)self;
+    return os->real.base.close((CLinuxLikeOs*)&os->real, fd);
+}
+
+static void patched_linux_os_init(PatchedLinuxOs* os, const char* nvmem_path)
+{
+    linux_os_init(&os->real);
+    os->base.open = patched_open;
+    os->base.read = patched_read;
+    os->base.write = patched_write;
+    os->base.ioctl = patched_ioctl;
+    os->base.lseek = patched_lseek;
+    os->base.close = patched_close;
+    os->nvmem_path = nvmem_path;
+}
+
+static bool write_stub_raw_value(int fd, uint16_t address, int16_t raw)
+{
+    union i2c_smbus_data smbus_data;
+    struct i2c_smbus_ioctl_data args;
+    memset(&smbus_data, 0, sizeof(smbus_data));
+    memset(&args, 0, sizeof(args));
+
+    if (ioctl(fd, I2C_SLAVE, address) < 0) return false;
+
+    smbus_data.word = (uint16_t)raw;
+    args.read_write = I2C_SMBUS_WRITE;
+    args.command = TEMP_REG;
+    args.size = I2C_SMBUS_WORD_DATA;
+    args.data = &smbus_data;
+
+    return ioctl(fd, I2C_SMBUS, &args) >= 0;
+}
+
+int main(void)
+{
+    const char* nvmem = "/tmp/demo_eeprom.nvmem";
+    const char* gpio_green = TM_GPIO_GREEN;
+    const char* gpio_yellow = TM_GPIO_YELLOW;
+    const char* gpio_red = TM_GPIO_RED;
+
+    printf("=== ThermalMonitor C Real-Linux Demo ===\n\n");
+
+    if (!setup_demo_fs(nvmem)) {
+        return 1;
+    }
+
+    int i2c_fd = open("/dev/i2c-1", O_RDWR);
+    if (i2c_fd < 0) {
+        fprintf(stderr, "ERROR: could not open /dev/i2c-1\n");
+        return 1;
+    }
+
+    PatchedLinuxOs os;
+    ThermalMonitor monitor;
+
+    patched_linux_os_init(&os, nvmem);
+
+    thermal_monitor_init(&monitor,
+                         (CLinuxLikeOs*)&os,
+                         100);
+    atomic_store(&g_last_temp, -9999);
+
+    printf("I2C device:  /dev/i2c-1  (real kernel i2c-stub)\n");
+    printf("NVMEM:       %s  (tmpfs)\n", nvmem);
+    printf("GPIO:        /sys/class/gpio/gpio1{0,1,2}/value  (kernel GPIO sysfs)\n\n");
+
+    if (!thermal_monitor_start(&monitor, on_temperature)) {
+        fprintf(stderr, "ERROR: could not start C thermal monitor\n");
+        close(i2c_fd);
+        return 1;
+    }
+
+    struct {
+        int16_t raw;
+        int16_t expected_dC;
+        int green;
+        int yellow;
+        int red;
+        const char* desc;
+    } samples[] = {
+        {  25,  250, 1, 0, 0, "25 degC  -> Green  (normal)" },
+        {  90,  900, 0, 1, 0, "90 degC  -> Yellow (warning)" },
+        { 110, 1100, 0, 0, 1, "110 degC -> Red    (critical)" },
+        {   3,   30, 0, 0, 1, "3 degC   -> Red    (cold)" },
+        {  50,  500, 1, 0, 0, "50 degC  -> Green  (boundary CRIT_LO)" },
+    };
+
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        if (!write_stub_raw_value(i2c_fd, 0x48, samples[i].raw)) {
+            fprintf(stderr, "ERROR: could not write raw value %d\n", samples[i].raw);
+            ok = false;
+            continue;
+        }
+
+        usleep(400000);
+
+        int last_temp = atomic_load(&g_last_temp);
+        int green = linux_gpio_read_value(gpio_green);
+        int yellow = linux_gpio_read_value(gpio_yellow);
+        int red = linux_gpio_read_value(gpio_red);
+
+        printf("Raw %5d  (%s)\n", samples[i].raw, samples[i].desc);
+        printf("  Callback dezi-C = %d\n", last_temp);
+        print_gpio("Green", gpio_green);
+        print_gpio("Yellow", gpio_yellow);
+        print_gpio("Red", gpio_red);
+
+        bool sample_ok = last_temp == samples[i].expected_dC &&
+                         green == samples[i].green &&
+                         yellow == samples[i].yellow &&
+                         red == samples[i].red;
+        printf("  Verdict  = %s\n\n", sample_ok ? "PASS" : "FAIL");
+        if (!sample_ok) ok = false;
+    }
+
+    thermal_monitor_stop(&monitor);
+    close(i2c_fd);
+
+    printf("Done: %s.\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
+====================================================================================================
+FILE: c_impl/interfaces.h
+====================================================================================================
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum { SENSOR_TYPE_A = 0, SENSOR_TYPE_B = 1 } CSensorType;
+
+typedef enum {
+    C_OPEN_READ_ONLY  = 0,
+    C_OPEN_WRITE_ONLY = 1,
+    C_OPEN_READ_WRITE = 2,
+} COpenFlags;
+
+typedef struct CLinuxLikeOs {
+    int     (*open) (struct CLinuxLikeOs* self, const char* path, COpenFlags flags);
+    ssize_t (*read) (struct CLinuxLikeOs* self, int fd, void* buf, size_t n);
+    ssize_t (*write)(struct CLinuxLikeOs* self, int fd, const void* buf, size_t n);
+    int     (*ioctl)(struct CLinuxLikeOs* self, int fd, unsigned long request, void* arg);
+    off_t   (*lseek)(struct CLinuxLikeOs* self, int fd, off_t offset, int whence);
+    int     (*close)(struct CLinuxLikeOs* self, int fd);
+} CLinuxLikeOs;
+
+#ifdef __cplusplus
+}
+#endif
+
+
+====================================================================================================
+FILE: c_impl/linux_adapters.c
+====================================================================================================
+
+#include "linux_adapters.h"
+
+#include <fcntl.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+static int to_posix_flags(COpenFlags flags)
+{
+    switch (flags) {
+        case C_OPEN_READ_ONLY:  return O_RDONLY;
+        case C_OPEN_WRITE_ONLY: return O_WRONLY;
+        case C_OPEN_READ_WRITE: return O_RDWR;
+    }
+    return O_RDONLY;
+}
+
+static int linux_open(CLinuxLikeOs* self, const char* path, COpenFlags flags)
+{
+    (void)self;
+    return open(path, to_posix_flags(flags));
+}
+
+static ssize_t linux_read(CLinuxLikeOs* self, int fd, void* buf, size_t n)
+{
+    (void)self;
+    return read(fd, buf, n);
+}
+
+static ssize_t linux_write(CLinuxLikeOs* self, int fd, const void* buf, size_t n)
+{
+    (void)self;
+    return write(fd, buf, n);
+}
+
+static int linux_ioctl(CLinuxLikeOs* self, int fd, unsigned long request, void* arg)
+{
+    (void)self;
+    return ioctl(fd, request, arg);
+}
+
+static off_t linux_lseek(CLinuxLikeOs* self, int fd, off_t offset, int whence)
+{
+    (void)self;
+    return lseek(fd, offset, whence);
+}
+
+static int linux_close(CLinuxLikeOs* self, int fd)
+{
+    (void)self;
+    return close(fd);
+}
+
+void linux_os_init(LinuxOs* os)
+{
+    os->base.open = linux_open;
+    os->base.read = linux_read;
+    os->base.write = linux_write;
+    os->base.ioctl = linux_ioctl;
+    os->base.lseek = linux_lseek;
+    os->base.close = linux_close;
+}
+
+int linux_gpio_read_value(const char* path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    char value = '\0';
+    ssize_t n = read(fd, &value, 1);
+    close(fd);
+    if (n < 1) return -1;
+    return value == '1' ? 1 : 0;
+}
+
+
+====================================================================================================
+FILE: c_impl/linux_adapters.h
+====================================================================================================
+
+#pragma once
+
+#include "interfaces.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    CLinuxLikeOs base;
+} LinuxOs;
+
+void linux_os_init(LinuxOs* os);
+int  linux_gpio_read_value(const char* path);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+====================================================================================================
+FILE: c_impl/mock_linux_os_c_adapter.hpp
+====================================================================================================
+
+#pragma once
+
+extern "C" {
+#include "interfaces.h"
+}
+
+#include "../platform/linux_like_os.hpp"
+
+#include <cstdint>
+
+struct CMockLinuxOsAdapter {
+    CLinuxLikeOs base{};
+    ILinuxLikeOs* os = nullptr;
+};
+
+inline OpenFlags toOpenFlags(COpenFlags flags)
+{
+    switch (flags) {
+        case C_OPEN_READ_ONLY:  return OpenFlags::ReadOnly;
+        case C_OPEN_WRITE_ONLY: return OpenFlags::WriteOnly;
+        case C_OPEN_READ_WRITE: return OpenFlags::ReadWrite;
+    }
+    return OpenFlags::ReadOnly;
+}
+
+inline int cMockOpen(CLinuxLikeOs* self, const char* path, COpenFlags flags)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->open(path, toOpenFlags(flags));
+}
+
+inline ssize_t cMockRead(CLinuxLikeOs* self, int fd, void* buf, size_t n)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->read(fd, buf, n);
+}
+
+inline ssize_t cMockWrite(CLinuxLikeOs* self, int fd, const void* buf, size_t n)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->write(fd, buf, n);
+}
+
+inline int cMockIoctl(CLinuxLikeOs* self, int fd, unsigned long request, void* arg)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->ioctl(fd, request, arg);
+}
+
+inline off_t cMockLseek(CLinuxLikeOs* self, int fd, off_t offset, int whence)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->lseek(fd, offset, whence);
+}
+
+inline int cMockClose(CLinuxLikeOs* self, int fd)
+{
+    auto* adapter = reinterpret_cast<CMockLinuxOsAdapter*>(self);
+    return adapter->os->close(fd);
+}
+
+inline void c_mock_linux_os_adapter_init(CMockLinuxOsAdapter* adapter, ILinuxLikeOs& os)
+{
+    adapter->base.open = cMockOpen;
+    adapter->base.read = cMockRead;
+    adapter->base.write = cMockWrite;
+    adapter->base.ioctl = cMockIoctl;
+    adapter->base.lseek = cMockLseek;
+    adapter->base.close = cMockClose;
+    adapter->os = &os;
+}
+
+
+====================================================================================================
+FILE: c_impl/qt_adapter.cpp
+====================================================================================================
+
+#include "qt_adapter.hpp"
+
+extern "C" {
+#include "thermal_monitor.h"
+}
+
+#include "mock_linux_os_c_adapter.hpp"
+#include "../platform/soc/mock_soc.hpp"
+
+struct CThermalMonitorAdapter::Impl {
+    MockSoC soc;
+    CMockLinuxOsAdapter osAdapter;
+    ThermalMonitor monitor;
+};
+
+CThermalMonitorAdapter::CThermalMonitorAdapter()
+    : impl_(std::make_unique<Impl>())
+{
+    c_mock_linux_os_adapter_init(&impl_->osAdapter, impl_->soc.os);
+    thermal_monitor_init(&impl_->monitor,
+                         reinterpret_cast<CLinuxLikeOs*>(&impl_->osAdapter),
+                         TM_POLL_MS);
+}
+
+CThermalMonitorAdapter::~CThermalMonitorAdapter() {
+    stop();
+}
+
+bool CThermalMonitorAdapter::start() {
+    return thermal_monitor_start(&impl_->monitor, nullptr);
+}
+
+void CThermalMonitorAdapter::stop() {
+    thermal_monitor_stop(&impl_->monitor);
+}
+
+bool CThermalMonitorAdapter::isRunning() const {
+    return thermal_monitor_running(&impl_->monitor);
+}
+
+void CThermalMonitorAdapter::setRawValue(int16_t v) {
+    impl_->soc.tempSensor->setRawValue(v);
+}
+
+void CThermalMonitorAdapter::setSensorType(SensorType type) {
+    impl_->soc.eepromFile->setByte(0, static_cast<uint8_t>(type));
+}
+
+void CThermalMonitorAdapter::injectSensorError(bool err) {
+    impl_->soc.tempSensor->injectError(err);
+}
+
+void CThermalMonitorAdapter::setStabilityConfig(uint8_t sampleCount,
+                                                unsigned int sampleSpacingMs,
+                                                int16_t hysteresisDeciCelsius) {
+    thermal_monitor_set_stability_config(&impl_->monitor,
+                                         ThermalStabilityConfig{
+                                             sampleCount,
+                                             sampleSpacingMs,
+                                             hysteresisDeciCelsius
+                                         });
+}
+
+int CThermalMonitorAdapter::getGpioValue(int gpio_num) {
+    if (gpio_num == 10) return impl_->soc.gpioGreen->getValue();
+    if (gpio_num == 11) return impl_->soc.gpioYellow->getValue();
+    if (gpio_num == 12) return impl_->soc.gpioRed->getValue();
+    return 0;
+}
+
+
+====================================================================================================
+FILE: c_impl/qt_adapter.hpp
+====================================================================================================
+
+#pragma once
+
+#include "../interfaces.h"
+#include <cstdint>
+#include <memory>
+
+class CThermalMonitorAdapter {
+public:
+    CThermalMonitorAdapter();
+    ~CThermalMonitorAdapter();
+
+    bool  start();
+    void  stop();
+    bool  isRunning() const;
+
+    void  setRawValue(int16_t v);
+    void  setSensorType(SensorType type);
+    void  injectSensorError(bool err);
+    void  setStabilityConfig(uint8_t sampleCount,
+                             unsigned int sampleSpacingMs,
+                             int16_t hysteresisDeciCelsius);
+
+    int   getGpioValue(int gpio_num);  // 0 or 1; gpio 10=green 11=yellow 12=red
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+
+====================================================================================================
+FILE: c_impl/tests/thermal_monitor_c_test.cpp
+====================================================================================================
+
+#include <gtest/gtest.h>
+
+extern "C" {
+#include "../thermal_monitor.h"
+}
+
+#include "mock_linux_os_c_adapter.hpp"
+#include "platform/soc/mock_soc.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <thread>
+
+static constexpr unsigned int TEST_POLL_MS = 10;
+static constexpr auto         SETTLE       = std::chrono::milliseconds{25};
+
+struct ThermalMonitorCTest : ::testing::Test {
+    MockSoC soc;
+    CMockLinuxOsAdapter osAdapter;
+    ThermalMonitor monitor;
+
+    void SetUp() override {
+        c_mock_linux_os_adapter_init(&osAdapter, soc.os);
+        thermal_monitor_init(&monitor,
+                             reinterpret_cast<CLinuxLikeOs*>(&osAdapter),
+                             TEST_POLL_MS);
+    }
+
+    void TearDown() override {
+        thermal_monitor_stop(&monitor);
+    }
+
+    bool checkLEDs(bool g, bool y, bool r) {
+        return soc.gpioGreen->getValue()  == (g ? 1 : 0) &&
+               soc.gpioYellow->getValue() == (y ? 1 : 0) &&
+               soc.gpioRed->getValue()    == (r ? 1 : 0);
+    }
+};
+
+TEST_F(ThermalMonitorCTest, TypeAThresholds) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_A));
+
+    soc.tempSensor->setRawValue(84);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "84 degC -> Green";
+
+    soc.tempSensor->setRawValue(85);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85 degC -> Yellow";
+
+    soc.tempSensor->setRawValue(105);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105 degC -> Red";
+
+    soc.tempSensor->setRawValue(5);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "5 degC (CRIT_LO boundary) -> Green";
+
+    soc.tempSensor->setRawValue(4);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4 degC -> Red (cold)";
+
+    soc.tempSensor->setRawValue(104);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "104 degC (below CRIT_HI) -> Yellow";
+}
+
+TEST_F(ThermalMonitorCTest, TypeBThresholds) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_B));
+
+    soc.tempSensor->setRawValue(849);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "84.9 degC -> Green";
+
+    soc.tempSensor->setRawValue(850);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85.0 degC -> Yellow";
+
+    soc.tempSensor->setRawValue(1050);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105.0 degC -> Red (critical high)";
+
+    soc.tempSensor->setRawValue(50);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "5.0 degC (CRIT_LO boundary) -> Green";
+
+    soc.tempSensor->setRawValue(49);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4.9 degC -> Red (critical low)";
+
+    soc.tempSensor->setRawValue(1049);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "104.9 degC (below CRIT_HI) -> Yellow";
+}
+
+TEST_F(ThermalMonitorCTest, SensorI2cError) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_A));
+    soc.tempSensor->setRawValue(80);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "80 degC -> Green";
+
+    soc.tempSensor->injectError(true);
+    bool sawOn = false, sawOff = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (soc.gpioRed->getValue() == 1) sawOn  = true;
+        if (soc.gpioRed->getValue() == 0) sawOff = true;
+        if (sawOn && sawOff) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    EXPECT_EQ(soc.gpioGreen->getValue(),  0);
+    EXPECT_EQ(soc.gpioYellow->getValue(), 0);
+    EXPECT_TRUE(sawOn && sawOff) << "Red must blink on I2C error";
+
+    soc.tempSensor->injectError(false);
+    soc.tempSensor->setRawValue(80);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "Recovery -> Green";
+}
+
+TEST(ThermalMonitorCEepromTest, EepromMissingAtStart) {
+    MockLinuxOs os;
+    MockI2cBus bus;
+    auto sensor = std::make_shared<MockTempSensorPeripheral>();
+    sensor->setRawValue(25);
+    bus.attach(0x48, sensor);
+    os.registerPath("/dev/i2c-1", std::make_shared<MockI2cDevFile>(bus));
+
+    auto gpioGreen  = std::make_shared<MockGpioValueFile>();
+    auto gpioYellow = std::make_shared<MockGpioValueFile>();
+    auto gpioRed    = std::make_shared<MockGpioValueFile>();
+    os.registerPath(TM_GPIO_GREEN, gpioGreen);
+    os.registerPath(TM_GPIO_YELLOW, gpioYellow);
+    os.registerPath(TM_GPIO_RED, gpioRed);
+    os.registerPath(TM_GPIO_EXPORT, std::make_shared<MockSinkFile>());
+    os.registerPath(TM_GPIO_GREEN_DIR, std::make_shared<MockSinkFile>());
+    os.registerPath(TM_GPIO_YELLOW_DIR, std::make_shared<MockSinkFile>());
+    os.registerPath(TM_GPIO_RED_DIR, std::make_shared<MockSinkFile>());
+
+    CMockLinuxOsAdapter osAdapter;
+    c_mock_linux_os_adapter_init(&osAdapter, os);
+
+    ThermalMonitor monitor;
+    thermal_monitor_init(&monitor,
+                         reinterpret_cast<CLinuxLikeOs*>(&osAdapter),
+                         TEST_POLL_MS);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+
+    bool sawOn = false, sawOff = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (gpioRed->getValue() == 1) sawOn  = true;
+        if (gpioRed->getValue() == 0) sawOff = true;
+        if (sawOn && sawOff) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    EXPECT_EQ(gpioGreen->getValue(),  0);
+    EXPECT_EQ(gpioYellow->getValue(), 0);
+    EXPECT_TRUE(sawOn && sawOff) << "Red must blink on EEPROM error";
+
+    thermal_monitor_stop(&monitor);
+}
+
+TEST_F(ThermalMonitorCTest, SensorTypeReadOnceAtStart) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_B));
+    soc.tempSensor->setRawValue(900);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "TypeB raw 900 -> Yellow";
+
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_A));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "Config change after start ignored";
+}
+
+TEST_F(ThermalMonitorCTest, TemperatureCallback) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_A));
+    soc.tempSensor->setRawValue(25);
+
+    static std::atomic<int16_t>* g_captured;
+    std::atomic<int16_t> captured{-999};
+    g_captured = &captured;
+
+    ASSERT_TRUE(thermal_monitor_start(&monitor, [](int16_t t) {
+        g_captured->store(t);
+    }));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_EQ(captured.load(), 250) << "25 degC TypeA -> 250 deci-degC";
+}
+
+TEST_F(ThermalMonitorCTest, MedianFilterSuppressesOutlier) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_A));
+    thermal_monitor_set_stability_config(&monitor, ThermalStabilityConfig{
+        3,
+        1,
+        0
+    });
+
+    soc.tempSensor->setRawSequence({84, 130, 84});
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(std::chrono::milliseconds{40});
+
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "median(84, 130, 84) degC -> Green";
+}
+
+TEST_F(ThermalMonitorCTest, HysteresisUsesConvertedTypeBTemperature) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SENSOR_TYPE_B));
+    thermal_monitor_set_stability_config(&monitor, ThermalStabilityConfig{
+        1,
+        0,
+        20
+    });
+
+    soc.tempSensor->setRawValue(850);
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85.0 degC enters Yellow";
+
+    soc.tempSensor->setRawValue(840);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "84.0 degC remains Yellow";
+
+    soc.tempSensor->setRawValue(829);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "82.9 degC exits Yellow";
+
+    soc.tempSensor->setRawValue(1050);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105.0 degC enters Red high";
+
+    soc.tempSensor->setRawValue(1040);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "104.0 degC remains Red high";
+
+    soc.tempSensor->setRawValue(1029);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "102.9 degC exits Red high to Yellow";
+
+    soc.tempSensor->setRawValue(49);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4.9 degC enters Red low";
+
+    soc.tempSensor->setRawValue(60);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "6.0 degC remains Red low";
+
+    soc.tempSensor->setRawValue(70);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "7.0 degC exits Red low";
+}
+
+TEST_F(ThermalMonitorCTest, StartStop) {
+    EXPECT_FALSE(thermal_monitor_running(&monitor));
+    ASSERT_TRUE(thermal_monitor_start(&monitor, nullptr));
+    EXPECT_TRUE(thermal_monitor_running(&monitor));
+    thermal_monitor_stop(&monitor);
+    EXPECT_FALSE(thermal_monitor_running(&monitor));
+}
+
+
+====================================================================================================
+FILE: c_impl/thermal_monitor.c
+====================================================================================================
+
+#include "thermal_monitor.h"
+
+#include <linux/i2c-dev.h>
+#include <linux/i2c.h>
+#include <assert.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define TM_SENSOR_ADDR 0x48
+#define TM_TEMP_REG    0x00
+#define TM_I2C_DEVICE  "/dev/i2c-1"
+#define TM_NVMEM_PATH  "/sys/bus/nvmem/devices/eeprom0/nvmem"
+
+static int16_t convert(int16_t raw, CSensorType type) {
+    if (type == SENSOR_TYPE_A) return (int16_t)(raw * 10);
+    return raw;
+}
+
+static void gpio_setup(ThermalMonitor* m) {
+    static const struct { const char* num; const char* dir; } gpios[3] = {
+        { "10\n", TM_GPIO_GREEN_DIR  },
+        { "11\n", TM_GPIO_YELLOW_DIR },
+        { "12\n", TM_GPIO_RED_DIR    },
+    };
+    for (int i = 0; i < 3; ++i) {
+        int fd = m->os->open(m->os, TM_GPIO_EXPORT, C_OPEN_WRITE_ONLY);
+        if (fd >= 0) { m->os->write(m->os, fd, gpios[i].num, 3); m->os->close(m->os, fd); }
+        fd = m->os->open(m->os, gpios[i].dir, C_OPEN_WRITE_ONLY);
+        if (fd >= 0) { m->os->write(m->os, fd, "out\n", 4); m->os->close(m->os, fd); }
+    }
+}
+
+static void gpio_write(ThermalMonitor* m, const char* path, int value) {
+    int fd = m->os->open(m->os, path, C_OPEN_WRITE_ONLY);
+    if (fd >= 0) {
+        const char v[2] = { value ? '1' : '0', '\n' };
+        m->os->write(m->os, fd, v, 2);
+        m->os->close(m->os, fd);
+    }
+}
+
+static void set_leds(ThermalMonitor* m, int green, int yellow, int red) {
+    gpio_write(m, TM_GPIO_GREEN,  green);
+    gpio_write(m, TM_GPIO_YELLOW, yellow);
+    gpio_write(m, TM_GPIO_RED,    red);
+}
+
+static void evaluate(ThermalMonitor* m, int16_t temp_dC) {
+    const int16_t h = m->stability.hysteresis_dC;
+
+    switch (m->led_state) {
+        case TM_LED_RED_HIGH:
+            if (temp_dC >= (int16_t)(TM_CRIT_HI - h)) break;
+            goto classify;
+        case TM_LED_RED_LOW:
+            if (temp_dC < (int16_t)(TM_CRIT_LO + h)) break;
+            goto classify;
+        case TM_LED_YELLOW:
+            if (temp_dC >= (int16_t)(TM_WARN - h) && temp_dC < TM_CRIT_HI) break;
+            goto classify;
+        case TM_LED_GREEN:
+            goto classify;
+    }
+
+    goto apply;
+
+classify:
+    if (temp_dC >= TM_CRIT_HI) m->led_state = TM_LED_RED_HIGH;
+    else if (temp_dC < TM_CRIT_LO) m->led_state = TM_LED_RED_LOW;
+    else if (temp_dC >= TM_WARN) m->led_state = TM_LED_YELLOW;
+    else m->led_state = TM_LED_GREEN;
+
+apply:
+    switch (m->led_state) {
+        case TM_LED_GREEN:
+            set_leds(m, 1, 0, 0);
+            break;
+        case TM_LED_YELLOW:
+            set_leds(m, 0, 1, 0);
+            break;
+        case TM_LED_RED_LOW:
+        case TM_LED_RED_HIGH:
+            set_leds(m, 0, 0, 1);
+            break;
+    }
+}
+
+static void set_error_state(ThermalMonitor* m) {
+    m->error_blink = !m->error_blink;
+    set_leds(m, 0, 0, m->error_blink ? 1 : 0);
+    if (m->callback) m->callback(-9999);
+}
+
+static void sleep_ms(unsigned int ms) {
+    struct timespec ts = {
+        .tv_sec  = (time_t)(ms / 1000),
+        .tv_nsec = (long)(ms % 1000) * 1000000L
+    };
+    nanosleep(&ts, NULL);
+}
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000U) + ((uint64_t)ts.tv_nsec / 1000000U);
+}
+
+static int read_sensor_type(ThermalMonitor* m, CSensorType* out) {
+    int fd = m->os->open(m->os, TM_NVMEM_PATH, C_OPEN_READ_ONLY);
+    if (fd < 0) return -1;
+
+    m->os->lseek(m->os, fd, 0, SEEK_SET);
+    uint8_t byte = 0;
+    ssize_t n = m->os->read(m->os, fd, &byte, 1);
+    m->os->close(m->os, fd);
+
+    if (n < 1) return -1;
+
+    *out = byte == (uint8_t)SENSOR_TYPE_B ? SENSOR_TYPE_B : SENSOR_TYPE_A;
+    return 0;
+}
+
+static int read_raw_i2c_rdwr(ThermalMonitor* m, int16_t* out) {
+    uint8_t reg = TM_TEMP_REG;
+    uint8_t buf[2] = {0, 0};
+    struct i2c_msg msgs[2] = {
+        { .addr = TM_SENSOR_ADDR, .flags = 0, .len = 1, .buf = &reg },
+        { .addr = TM_SENSOR_ADDR, .flags = I2C_M_RD, .len = 2, .buf = buf },
+    };
+    struct i2c_rdwr_ioctl_data data = {
+        .msgs = msgs,
+        .nmsgs = 2,
+    };
+
+    if (m->os->ioctl(m->os, m->i2c_fd, I2C_RDWR, &data) < 0) return -1;
+    *out = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+    return 0;
+}
+
+static int read_raw_smbus(ThermalMonitor* m, int16_t* out) {
+    union i2c_smbus_data smbus_data;
+    struct i2c_smbus_ioctl_data args;
+    memset(&smbus_data, 0, sizeof(smbus_data));
+    memset(&args, 0, sizeof(args));
+
+    if (m->os->ioctl(m->os, m->i2c_fd, I2C_SLAVE, (void*)(uintptr_t)TM_SENSOR_ADDR) < 0)
+        return -1;
+
+    args.read_write = I2C_SMBUS_READ;
+    args.command = TM_TEMP_REG;
+    args.size = I2C_SMBUS_WORD_DATA;
+    args.data = &smbus_data;
+
+    if (m->os->ioctl(m->os, m->i2c_fd, I2C_SMBUS, &args) < 0) return -1;
+    *out = (int16_t)smbus_data.word;
+    return 0;
+}
+
+static int read_raw_from_i2c(ThermalMonitor* m, int16_t* out) {
+    if (read_raw_i2c_rdwr(m, out) == 0) return 0;
+    if (read_raw_smbus(m, out) == 0) return 0;
+    return -1;
+}
+
+static int16_t median(int16_t* values, size_t count) {
+    for (size_t i = 1; i < count; ++i) {
+        int16_t key = values[i];
+        size_t j = i;
+        while (j > 0 && values[j - 1] > key) {
+            values[j] = values[j - 1];
+            --j;
+        }
+        values[j] = key;
+    }
+    for (size_t i = 1; i < count; ++i) {
+        assert(values[i - 1] <= values[i]);
+    }
+    return values[count / 2];
+}
+
+static int read_filtered_temperature(ThermalMonitor* m, CSensorType type, int16_t* out) {
+    int16_t values[TM_MAX_FILTER_SAMPLES] = {0};
+    size_t count = m->stability.sample_count;
+    if (count < 1) count = 1;
+    if (count > TM_MAX_FILTER_SAMPLES) count = TM_MAX_FILTER_SAMPLES;
+
+    for (size_t i = 0; i < count; ++i) {
+        int16_t raw = 0;
+        if (read_raw_from_i2c(m, &raw) != 0) return -1;
+        values[i] = convert(raw, type);
+
+        if (i + 1 < count && m->stability.sample_spacing_ms > 0) {
+            const uint64_t deadline = now_ms() + m->stability.sample_spacing_ms;
+            while (atomic_load(&m->running) && now_ms() < deadline) {
+                sleep_ms(1);
+            }
+            if (!atomic_load(&m->running)) return -1;
+        }
+    }
+
+    *out = median(values, count);
+    return 0;
+}
+
+static void* polling_loop(void* arg) {
+    ThermalMonitor* m = (ThermalMonitor*)arg;
+
+    CSensorType type;
+    bool type_ok = (read_sensor_type(m, &type) == 0);
+
+    while (atomic_load(&m->running)) {
+        const uint64_t loop_start = now_ms();
+
+        if (!type_ok) {
+            set_error_state(m);
+        } else {
+            int16_t temp_dC = 0;
+            if (read_filtered_temperature(m, type, &temp_dC) != 0) {
+                set_error_state(m);
+            } else {
+                evaluate(m, temp_dC);
+                if (m->callback) m->callback(temp_dC);
+            }
+        }
+
+        const uint64_t elapsed = now_ms() - loop_start;
+        if (elapsed < m->poll_ms) sleep_ms((unsigned int)(m->poll_ms - elapsed));
+    }
+
+    return NULL;
+}
+
+void thermal_monitor_init(ThermalMonitor* m,
+                          CLinuxLikeOs*   os,
+                          unsigned int    poll_ms) {
+    m->os          = os;
+    m->poll_ms     = poll_ms ? poll_ms : TM_POLL_MS;
+    m->callback    = NULL;
+    m->error_blink = false;
+    m->i2c_fd      = -1;
+    m->led_state   = TM_LED_GREEN;
+    m->stability.sample_count = 1;
+    m->stability.sample_spacing_ms = 0;
+    m->stability.hysteresis_dC = 0;
+    atomic_store(&m->running, 0);
+}
+
+void thermal_monitor_set_stability_config(ThermalMonitor* m,
+                                           ThermalStabilityConfig config) {
+    if (config.sample_count == 0) config.sample_count = 1;
+    if (config.sample_count > TM_MAX_FILTER_SAMPLES)
+        config.sample_count = TM_MAX_FILTER_SAMPLES;
+    if (config.hysteresis_dC < 0) config.hysteresis_dC = 0;
+    m->stability = config;
+}
+
+bool thermal_monitor_start(ThermalMonitor* m, TemperatureCallback cb) {
+    if (atomic_load(&m->running)) return true;
+    atomic_store(&m->running, 1);
+    m->callback = cb;
+
+    m->i2c_fd = m->os->open(m->os, TM_I2C_DEVICE, C_OPEN_READ_WRITE);
+    if (m->i2c_fd < 0) {
+        atomic_store(&m->running, 0);
+        return false;
+    }
+
+    gpio_setup(m);
+    if (pthread_create(&m->thread, NULL, polling_loop, m) != 0) {
+        m->os->close(m->os, m->i2c_fd);
+        m->i2c_fd = -1;
+        atomic_store(&m->running, 0);
+        return false;
+    }
+    return true;
+}
+
+void thermal_monitor_stop(ThermalMonitor* m) {
+    if (!atomic_load(&m->running)) return;
+    atomic_store(&m->running, 0);
+    pthread_join(m->thread, NULL);
+    if (m->i2c_fd >= 0) {
+        m->os->close(m->os, m->i2c_fd);
+        m->i2c_fd = -1;
+    }
+}
+
+bool thermal_monitor_running(const ThermalMonitor* m) {
+    return atomic_load(&m->running) != 0;
+}
+
+
+====================================================================================================
+FILE: c_impl/thermal_monitor.h
+====================================================================================================
+
+#pragma once
+
+#include "interfaces.h"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define TM_CRIT_LO    50
+#define TM_WARN       850
+#define TM_CRIT_HI    1050
+#define TM_POLL_MS    100
+#define TM_MAX_FILTER_SAMPLES 9
+
+#define TM_GPIO_EXPORT     "/sys/class/gpio/export"
+#define TM_GPIO_GREEN      "/sys/class/gpio/gpio10/value"
+#define TM_GPIO_YELLOW     "/sys/class/gpio/gpio11/value"
+#define TM_GPIO_RED        "/sys/class/gpio/gpio12/value"
+#define TM_GPIO_GREEN_DIR  "/sys/class/gpio/gpio10/direction"
+#define TM_GPIO_YELLOW_DIR "/sys/class/gpio/gpio11/direction"
+#define TM_GPIO_RED_DIR    "/sys/class/gpio/gpio12/direction"
+
+typedef void (*TemperatureCallback)(int16_t temp_dC);
+
+typedef enum {
+    TM_LED_GREEN = 0,
+    TM_LED_YELLOW,
+    TM_LED_RED_LOW,
+    TM_LED_RED_HIGH,
+} ThermalLedState;
+
+typedef struct {
+    uint8_t      sample_count;
+    unsigned int sample_spacing_ms;
+    int16_t      hysteresis_dC;
+} ThermalStabilityConfig;
+
+typedef struct {
+    CLinuxLikeOs*   os;
+    unsigned int    poll_ms;
+
+    pthread_t       thread;
+#ifdef __cplusplus
+    int             running;
+#else
+    _Atomic int     running;
+#endif
+    bool            error_blink;
+    int             i2c_fd;
+    ThermalLedState led_state;
+    ThermalStabilityConfig stability;
+
+    TemperatureCallback callback;
+} ThermalMonitor;
+
+void thermal_monitor_init    (ThermalMonitor* m,
+                              CLinuxLikeOs*  os,
+                              unsigned int   poll_ms);
+void thermal_monitor_set_stability_config(ThermalMonitor* m,
+                                           ThermalStabilityConfig config);
+
+bool thermal_monitor_start   (ThermalMonitor* m, TemperatureCallback cb);
+void thermal_monitor_stop    (ThermalMonitor* m);
+bool thermal_monitor_running (const ThermalMonitor* m);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+====================================================================================================
+FILE: demo_real_hw.cpp
+====================================================================================================
+
+#include "thermal_monitor.h"
+#include "platform/real_linux_os.hpp"
+#include "platform/i2c/i2c_types.hpp"
+
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#include <chrono>
+#include <fcntl.h>
+#include <unistd.h>
+
+// Prepare the fake NVMEM file. GPIO is expected to be provided by the kernel.
+static bool setup_demo_fs(const char* nvmem_path)
+{
+    // NVMEM: TypeA = 0x00
+    int fd = ::open(nvmem_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { perror("open nvmem"); return false; }
+    uint8_t type_a = 0x00;
+    ssize_t written = ::write(fd, &type_a, 1);
+    ::close(fd);
+    return written == 1;
+}
+
+static void print_gpio(const char* label, const char* path) {
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return;
+    char buf[4] = {};
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n < 1) return;
+    buf[strcspn(buf, "\n")] = '\0';
+    printf("  %-8s = %s  (%s)\n", label, buf, path);
+}
+
+static int read_gpio_value(const char* path) {
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    char value = '\0';
+    ssize_t n = ::read(fd, &value, 1);
+    ::close(fd);
+    if (n < 1) return -1;
+    return value == '1' ? 1 : 0;
+}
+
+static bool write_stub_raw_value(int16_t raw) {
+    int i2c_fd = ::open("/dev/i2c-1", O_RDWR);
+    if (i2c_fd < 0) {
+        perror("open /dev/i2c-1");
+        return false;
+    }
+
+    if (::ioctl(i2c_fd, I2C_SLAVE, reinterpret_cast<void*>(static_cast<uintptr_t>(0x48))) < 0) {
+        perror("ioctl I2C_SLAVE");
+        ::close(i2c_fd);
+        return false;
+    }
+
+    i2c_smbus_data smbusData{};
+    smbusData.word = static_cast<uint16_t>(raw);
+    i2c_smbus_ioctl_data smbusArgs{
+        I2C_SMBUS_WRITE,
+        0x00,
+        I2C_SMBUS_WORD_DATA,
+        &smbusData
+    };
+
+    if (::ioctl(i2c_fd, I2C_SMBUS, &smbusArgs) < 0) {
+        perror("ioctl I2C_SMBUS write word");
+        ::close(i2c_fd);
+        return false;
+    }
+
+    ::close(i2c_fd);
+    return true;
+}
+
+int main() {
+    printf("=== ThermalMonitor Real-Linux Demo ===\n\n");
+
+    // Temporary NVMEM path; GPIO uses the real kernel sysfs paths.
+    const char* NVMEM  = "/tmp/demo_eeprom.nvmem";
+    const char* G_GRN  = "/sys/class/gpio/gpio10/value";
+    const char* G_YEL  = "/sys/class/gpio/gpio11/value";
+    const char* G_RED  = "/sys/class/gpio/gpio12/value";
+
+    if (!setup_demo_fs(NVMEM)) return 1;
+
+    // RealLinuxOs: every open/read/write/ioctl/lseek/close is a real syscall
+    RealLinuxOs realOs;
+
+    // Wrap RealLinuxOs and redirect only NVMEM to a temporary file.
+    // /dev/i2c-1 passes through to the real kernel i2c-stub device.
+    struct PatchedOs : public ILinuxLikeOs {
+        RealLinuxOs real;
+
+        std::string translate(const std::string& path) {
+            if (path == "/sys/bus/nvmem/devices/eeprom0/nvmem") return "/tmp/demo_eeprom.nvmem";
+            return path;  // /dev/i2c-1 passes through to real kernel
+        }
+        Fd      open (const std::string& path, OpenFlags f) override { return real.open(translate(path), f); }
+        ssize_t read (Fd fd, void* b, size_t n)             override { return real.read(fd, b, n); }
+        ssize_t write(Fd fd, const void* b, size_t n)       override { return real.write(fd, b, n); }
+        int     ioctl(Fd fd, unsigned long req, void* arg)  override { return real.ioctl(fd, req, arg); }
+        off_t   lseek(Fd fd, off_t off, int wh)             override { return real.lseek(fd, off, wh); }
+        int     close(Fd fd)                                override { return real.close(fd); }
+    } os;
+
+    printf("I2C device:  /dev/i2c-1  (real kernel i2c-stub)\n");
+    printf("NVMEM:       %s  (tmpfs)\n", NVMEM);
+    printf("GPIO:        /sys/class/gpio/gpio1{0,1,2}/value  (kernel GPIO sysfs)\n\n");
+
+    ThermalMonitor monitor(os, std::chrono::milliseconds{200});
+
+    int16_t last_temp = -9999;
+    monitor.setOnTemperatureCallback([&](int16_t t) { last_temp = t; });
+
+    if (!monitor.start()) {
+        fprintf(stderr, "ERROR: could not open /dev/i2c-1 — is i2c-stub loaded?\n");
+        fprintf(stderr, "Run: sudo modprobe i2c-stub chip_addr=0x48 && sudo modprobe i2c-dev\n");
+        return 1;
+    }
+
+    printf("Monitor running. Reading from /dev/i2c-1 (I2C_RDWR ioctl)...\n\n");
+
+    // Simulate changing temperature via i2cset values
+    struct {
+        int16_t raw;
+        int16_t expected_dC;
+        int green;
+        int yellow;
+        int red;
+        const char* desc;
+    } temps[] = {
+        {  25,  250, 1, 0, 0, "25 degC  -> Green  (normal)"},
+        {  90,  900, 0, 1, 0, "90 degC  -> Yellow (warning)"},
+        { 110, 1100, 0, 0, 1, "110 degC -> Red    (critical)"},
+        {   3,   30, 0, 0, 1, "3 degC   -> Red    (cold)"},
+        {  50,  500, 1, 0, 0, "50 degC  -> Green  (boundary CRIT_LO)"},
+    };
+
+    bool ok = true;
+    for (auto& t : temps) {
+        if (!write_stub_raw_value(t.raw)) {
+            ok = false;
+            continue;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds{400});
+
+        printf("Raw %5d  (%s)\n", t.raw, t.desc);
+        printf("  Callback dezi-C = %d\n", last_temp);
+        print_gpio("Green",  G_GRN);
+        print_gpio("Yellow", G_YEL);
+        print_gpio("Red",    G_RED);
+
+        int green = read_gpio_value(G_GRN);
+        int yellow = read_gpio_value(G_YEL);
+        int red = read_gpio_value(G_RED);
+        bool sampleOk = last_temp == t.expected_dC &&
+                        green == t.green &&
+                        yellow == t.yellow &&
+                        red == t.red;
+        printf("  Verdict  = %s\n", sampleOk ? "PASS" : "FAIL");
+        if (!sampleOk) ok = false;
+        printf("\n");
+    }
+
+    monitor.stop();
+    printf("Done: %s.\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+
+====================================================================================================
+FILE: docs/README.md
+====================================================================================================
+
+# Thermal Monitor
+
+Thermal Monitor is a small embedded-style temperature monitor implemented in C++ and C. It reads a temperature sensor, reads a sensor type configuration, and drives three status LEDs:
+
+- Green: normal temperature
+- Yellow: warning temperature
+- Red: critical high/low temperature or sensor/config error blink
+
+The project also contains a Qt simulator, unit tests, Linux hardware adapters, and a QEMU-based hardware integration test.
+
+Architecture diagram: [architecture.svg](architecture.svg)
+
+## Behavior
+
+All temperatures are evaluated internally in deci-Celsius.
+
+| Range | LED |
+| --- | --- |
+| `< 5.0 C` | Red |
+| `>= 5.0 C && < 85.0 C` | Green |
+| `>= 85.0 C && < 105.0 C` | Yellow |
+| `>= 105.0 C` | Red |
+
+Sensor type conversion:
+
+- `TypeA`: raw value is Celsius, converted with `raw * 10`
+- `TypeB`: raw value is already deci-Celsius
+
+On sensor or config read failure, the monitor turns green/yellow off and blinks red.
+
+Both implementations also support an optional stability configuration:
+
+- Median filtering: read `sampleCount` values with `sampleSpacing` between reads and evaluate the median.
+- Hysteresis: keep Yellow or Red active until the converted deci-Celsius temperature moves below/above the configured exit margin.
+
+Defaults preserve the direct behavior: one sample, no sample spacing, no hysteresis.
+
+## Project Layout
+
+```text
+thermal_monitor.cpp/.h          C++ monitor core
+interfaces.h                    C++ sensor type definition
+platform/                       C++ Linux abstraction and mocks
+tests/                          C++ GoogleTest tests
+docs/                           Architecture/design documentation
+qemu/                           Reproducible QEMU VM setup
+
+c_impl/thermal_monitor.c/.h     C monitor core
+c_impl/interfaces.h             C Linux-like OS interface
+c_impl/linux_adapters.c/.h      C Linux hardware adapters
+c_impl/mock_linux_os_c_adapter.hpp
+                                Adapter from C interface to C++ mock OS
+c_impl/qt_adapter.cpp/.hpp      C++ wrapper for using the C monitor in Qt
+c_impl/tests/                   C GoogleTest tests
+
+demo_real_hw.cpp                C++ real-Linux/QEMU hardware demo/test
+c_impl/demo_real_hw_c.c         C real-Linux/QEMU hardware demo/test
+tools/gpio_sysfs_mock/          Small kernel module for QEMU GPIO sysfs test
+scripts/run_qemu_hw_integration.sh
+                                Full QEMU hardware integration test runner
+```
+
+## Architecture
+
+### C++ Path
+
+`ThermalMonitorCore` contains the C++ monitor logic and depends on `ILinuxLikeOs` instead of calling Linux syscalls directly. This allows the same core to run against:
+
+- `MockLinuxOs` in unit tests
+- `RealLinuxOs` in the real-Linux/QEMU demo
+
+The C++ monitor reads:
+
+- `/dev/i2c-1` for the temperature sensor at address `0x48`
+- `/sys/bus/nvmem/devices/eeprom0/nvmem` for the sensor type
+- `/sys/class/gpio/gpio10/value`
+- `/sys/class/gpio/gpio11/value`
+- `/sys/class/gpio/gpio12/value`
+
+For I2C, it first tries `I2C_RDWR`. If that fails, it falls back to SMBus word read, which is required by Linux `i2c-stub`.
+
+Optional stability behavior is configured through `ThermalStabilityConfig` and `ThermalMonitor::setStabilityConfig(...)`.
+
+### C Path
+
+The C core in `c_impl/thermal_monitor.c` mirrors the C++ path closely. It uses a small C vtable, `CLinuxLikeOs`, with Linux-like operations:
+
+- `open`
+- `read`
+- `write`
+- `ioctl`
+- `lseek`
+- `close`
+
+That keeps the monitor testable without adding separate C-only sensor/config/GPIO mock layers. The C unit tests and the Qt adapter reuse the existing C++ `MockSoC` through `c_impl/mock_linux_os_c_adapter.hpp`, so the C and C++ monitors exercise the same simulated `/dev/i2c-1`, NVMEM, and GPIO files.
+
+The real adapter in `c_impl/linux_adapters.c` maps `CLinuxLikeOs` to POSIX/Linux syscalls.
+
+Optional stability behavior is configured through `ThermalStabilityConfig` and `thermal_monitor_set_stability_config(...)`.
+
+C libraries are split by responsibility:
+
+- `ThermalMonitorC`: C core plus the C Linux-like interface
+- `ThermalMonitorCLinux`: Linux hardware adapters
+
+## Build Locally
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+The default build includes:
+
+- `ThermalSimulator` Qt GUI
+- C++ core library
+- C core library
+- C Linux adapters
+- C++ hardware demo
+- C hardware demo
+- unit tests
+
+You can also use plain make after configuring:
+
+```bash
+make -C build -j$(nproc)
+```
+
+## Run Unit Tests
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Expected result:
+
+```text
+100% tests passed, 0 tests failed out of 18
+```
+
+The unit tests cover:
+
+- TypeA thresholds
+- TypeB thresholds
+- sensor/I2C error handling
+- config/EEPROM error handling
+- callback behavior
+- start/stop behavior
+- sensor type is read once at startup
+- median filtering
+- hysteresis after sensor-type conversion
+
+## Run Qt Simulator
+
+```bash
+./build/ThermalSimulator
+```
+
+The simulator uses mock sensor/config/GPIO backends. It does not require real hardware or QEMU.
+
+## QEMU Hardware Integration Test
+
+The automated QEMU test is:
+
+```bash
+scripts/run_qemu_hw_integration.sh
+```
+
+It expects the VM assets in:
+
+```text
+qemu/
+```
+
+The script can be configured with environment variables:
+
+```bash
+QEMU_DIR=/path/to/qemu-dir \
+VM_PORT=2222 \
+scripts/run_qemu_hw_integration.sh
+```
+
+Create the local VM image first:
+
+```bash
+qemu/create-vm-image.sh
+qemu/provision-vm.sh
+```
+
+The generated qcow2 image, cloud-init ISO, SSH key, and logs are ignored by Git. See [qemu/README.md](../qemu/README.md).
+
+To return to a clean local QEMU state:
+
+```bash
+qemu/clean.sh
+```
+
+The script performs the complete flow:
+
+1. Starts the QEMU Debian VM.
+2. Waits for SSH.
+3. Syncs this repository into the VM.
+4. Builds and loads `tools/gpio_sysfs_mock/thermal_gpio_mock.ko`.
+5. Exports GPIO 10, 11, and 12 through `/sys/class/gpio`.
+6. Loads `i2c-dev` and `i2c-stub chip_addr=0x48`.
+7. Builds the project in the VM.
+8. Runs all unit tests.
+9. Runs the C++ hardware demo/test.
+10. Runs the C hardware demo/test.
+11. Powers off the VM.
+
+The integration test uses real Linux kernel interfaces for:
+
+- I2C: `/dev/i2c-1` via `i2c-stub`
+- GPIO: `/sys/class/gpio/gpio10..12/value` via the test GPIO kernel module
+
+NVMEM is intentionally simulated with:
+
+```text
+/tmp/demo_eeprom.nvmem
+```
+
+Expected final output includes:
+
+```text
+ctest: 18/18 passed
+C++ demo_real_hw: Done: PASS.
+C demo_real_hw_c: Done: PASS.
+VM is down.
+```
+
+## Manual Hardware Demo Setup
+
+Inside a Linux VM or target with the required kernel interfaces:
+
+```bash
+sudo modprobe i2c-dev
+sudo modprobe i2c-stub chip_addr=0x48
+```
+
+For QEMU GPIO sysfs testing:
+
+```bash
+cd tools/gpio_sysfs_mock
+make
+sudo insmod thermal_gpio_mock.ko
+for n in 10 11 12; do
+    [ -d /sys/class/gpio/gpio$n ] || echo $n | sudo tee /sys/class/gpio/export
+done
+```
+
+Then run:
+
+```bash
+sudo ./build/demo_real_hw
+sudo ./build/c_impl/thermal_monitor_c_demo_real
+```
+
+## Notes
+
+- GPIO sysfs is deprecated in modern Linux, but it is used here because the monitor requirements and existing code target `/sys/class/gpio`.
+- The C core stays hardware-neutral; platform-specific behavior belongs in adapters.
+- The C++ core stays syscall-neutral through `ILinuxLikeOs`.
+
+
+====================================================================================================
+FILE: interfaces.h
+====================================================================================================
+
+#pragma once
+#include <cstdint>
+
+enum class SensorType { TypeA_1_Per_Unit = 0, TypeB_0_1_Per_Unit = 1 };
+
+
+====================================================================================================
+FILE: main.cpp
+====================================================================================================
+
+#include <QApplication>
+#include "mainwindow.h"
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    MainWindow window;
+    window.show();
+    return app.exec();
+}
+
+
+====================================================================================================
+FILE: mainwindow.cpp
+====================================================================================================
+
+#include "mainwindow.h"
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QGroupBox>
+#include <QLabel>
+#include <QSpinBox>
+#include <QComboBox>
+#include <QPushButton>
+#include <QTabWidget>
+#include <QTimer>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction / destruction
+// ─────────────────────────────────────────────────────────────────────────────
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent),
+      monitor_(soc_.os)
+{
+    setWindowTitle("Thermal Monitor Demo");
+    resize(480, 480);
+
+    auto* tabs = new QTabWidget(this);
+    setCentralWidget(tabs);
+
+    QWidget* cppTab = buildTab(cppW_);
+    QWidget* cTab   = buildTab(cW_);
+    tabs->addTab(cppTab, "C++ / Linux SoM");
+    tabs->addTab(cTab,   "C / POSIX");
+
+    // ── C++ tab wiring ───────────────────────────────────────────────────
+    connect(cppW_.tempInput, QOverload<int>::of(&QSpinBox::valueChanged),
+            [this](int v) {
+                soc_.tempSensor->setRawValue(static_cast<int16_t>(v));
+            });
+    connect(cppW_.sensorTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            [this](int idx) {
+                uint8_t b = static_cast<uint8_t>(cppW_.sensorTypeCombo->itemData(idx).toInt());
+                soc_.eepromFile->setByte(0, b);
+            });
+    connect(cppW_.startBtn, &QPushButton::clicked, this, &MainWindow::onStartCpp);
+    connect(cppW_.stopBtn,  &QPushButton::clicked, this, &MainWindow::onStopCpp);
+
+    // ── C tab wiring ─────────────────────────────────────────────────────
+    connect(cW_.tempInput, QOverload<int>::of(&QSpinBox::valueChanged),
+            [this](int v) {
+                cMonitor_.setRawValue(static_cast<int16_t>(v));
+            });
+    connect(cW_.sensorTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            [this](int idx) {
+                auto t = static_cast<SensorType>(cW_.sensorTypeCombo->itemData(idx).toInt());
+                cMonitor_.setSensorType(t);
+            });
+    connect(cW_.startBtn, &QPushButton::clicked, this, &MainWindow::onStartC);
+    connect(cW_.stopBtn,  &QPushButton::clicked, this, &MainWindow::onStopC);
+
+    // ── LED poll timer (shared, 50 ms) ────────────────────────────────────
+    pollTimer_ = new QTimer(this);
+    connect(pollTimer_, &QTimer::timeout, this, &MainWindow::onUpdateLEDs);
+    pollTimer_->start(50);
+}
+
+MainWindow::~MainWindow() {
+    monitor_.stop();
+    cMonitor_.stop();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab builder  — identical layout for both tabs
+// ─────────────────────────────────────────────────────────────────────────────
+
+QWidget* MainWindow::buildTab(TabWidgets& w) {
+    auto* page = new QWidget;
+    auto* root = new QVBoxLayout(page);
+    root->setContentsMargins(12, 12, 12, 12);
+    root->setSpacing(10);
+
+    // ── Sensor simulation group ───────────────────────────────────────────
+    auto* sensorGroup  = new QGroupBox("Sensor Simulation (mock)");
+    auto* sensorLayout = new QVBoxLayout(sensorGroup);
+
+    auto* typeRow = new QHBoxLayout;
+    typeRow->addWidget(new QLabel("Sensor Type:"));
+    w.sensorTypeCombo = new QComboBox;
+    w.sensorTypeCombo->addItem("Type A  (1 °C / unit)",
+                               static_cast<int>(SensorType::TypeA_1_Per_Unit));
+    w.sensorTypeCombo->addItem("Type B  (0.1 °C / unit)",
+                               static_cast<int>(SensorType::TypeB_0_1_Per_Unit));
+    typeRow->addWidget(w.sensorTypeCombo);
+    sensorLayout->addLayout(typeRow);
+
+    auto* adrRow = new QHBoxLayout;
+    adrRow->addWidget(new QLabel("Raw ADC Value:"));
+    w.tempInput = new QSpinBox;
+    w.tempInput->setRange(-32768, 32767);
+    w.tempInput->setValue(250);
+    adrRow->addWidget(w.tempInput);
+    sensorLayout->addLayout(adrRow);
+
+    root->addWidget(sensorGroup);
+
+    // ── LED panel group ───────────────────────────────────────────────────
+    auto* ledGroup  = new QGroupBox("Operator Panel (GPIO mock)");
+    auto* ledLayout = new QVBoxLayout(ledGroup);
+    auto* ledRow    = new QHBoxLayout;
+
+    auto makeLed = [](const QString& letter) {
+        auto* lbl = new QLabel(letter);
+        lbl->setAlignment(Qt::AlignCenter);
+        lbl->setFixedSize(64, 64);
+        lbl->setStyleSheet("QLabel { background-color:#333; color:white; "
+                           "border-radius:32px; font-weight:bold; font-size:20px; }");
+        return lbl;
+    };
+
+    w.ledGreen  = makeLed("G");
+    w.ledYellow = makeLed("Y");
+    w.ledRed    = makeLed("R");
+
+    ledRow->addStretch();
+    ledRow->addWidget(w.ledGreen);
+    ledRow->addSpacing(8);
+    ledRow->addWidget(w.ledYellow);
+    ledRow->addSpacing(8);
+    ledRow->addWidget(w.ledRed);
+    ledRow->addStretch();
+    ledLayout->addLayout(ledRow);
+    root->addWidget(ledGroup);
+
+    // ── Start / Stop buttons ──────────────────────────────────────────────
+    auto* btnRow = new QHBoxLayout;
+    w.startBtn = new QPushButton("Start Monitor");
+    w.stopBtn  = new QPushButton("Stop Monitor");
+    w.stopBtn->setEnabled(false);
+    btnRow->addStretch();
+    btnRow->addWidget(w.startBtn);
+    btnRow->addWidget(w.stopBtn);
+    btnRow->addStretch();
+    root->addLayout(btnRow);
+
+    root->addStretch();
+    return page;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slots — C++ tab
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MainWindow::onStartCpp() {
+    monitor_.start();
+    cppW_.startBtn->setEnabled(false);
+    cppW_.stopBtn ->setEnabled(true);
+}
+
+void MainWindow::onStopCpp() {
+    monitor_.stop();
+    cppW_.startBtn->setEnabled(true);
+    cppW_.stopBtn ->setEnabled(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slots — C tab
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MainWindow::onStartC() {
+    cMonitor_.start();
+    cW_.startBtn->setEnabled(false);
+    cW_.stopBtn ->setEnabled(true);
+}
+
+void MainWindow::onStopC() {
+    cMonitor_.stop();
+    cW_.startBtn->setEnabled(true);
+    cW_.stopBtn ->setEnabled(false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LED poll — updates both tabs from their respective panels
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MainWindow::applyLED(QLabel* label, int value, const char* color) {
+    if (value) {
+        label->setStyleSheet(
+            QString("QLabel { background-color:%1; color:black; "
+                    "border-radius:32px; font-weight:bold; font-size:20px; }").arg(color));
+    } else {
+        label->setStyleSheet(
+            "QLabel { background-color:#333; color:white; "
+            "border-radius:32px; font-weight:bold; font-size:20px; }");
+    }
+}
+
+void MainWindow::onUpdateLEDs() {
+    // C++ tab — read from mock GPIO files
+    applyLED(cppW_.ledGreen,  soc_.gpioGreen->getValue(),  "#00ff00");
+    applyLED(cppW_.ledYellow, soc_.gpioYellow->getValue(), "#ffff00");
+    applyLED(cppW_.ledRed,    soc_.gpioRed->getValue(),    "#ff0000");
+
+    // C tab — read from MockOs gpio array
+    applyLED(cW_.ledGreen,  cMonitor_.getGpioValue(10), "#00ff00");
+    applyLED(cW_.ledYellow, cMonitor_.getGpioValue(11), "#ffff00");
+    applyLED(cW_.ledRed,    cMonitor_.getGpioValue(12), "#ff0000");
+}
+
+
+====================================================================================================
+FILE: mainwindow.h
+====================================================================================================
+
+#pragma once
+
+#include <QMainWindow>
+#include "thermal_monitor.h"
+#include "platform/soc/mock_soc.hpp"
+#include "c_impl/qt_adapter.hpp"
+
+class QLabel;
+class QSpinBox;
+class QComboBox;
+class QPushButton;
+class QTabWidget;
+class QTimer;
+
+struct TabWidgets {
+    QLabel*      ledGreen        = nullptr;
+    QLabel*      ledYellow       = nullptr;
+    QLabel*      ledRed          = nullptr;
+    QSpinBox*    tempInput       = nullptr;
+    QComboBox*   sensorTypeCombo = nullptr;
+    QPushButton* startBtn        = nullptr;
+    QPushButton* stopBtn         = nullptr;
+};
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
+
+private slots:
+    void onStartCpp();
+    void onStopCpp();
+    void onStartC();
+    void onStopC();
+    void onUpdateLEDs();
+
+private:
+    QWidget* buildTab(TabWidgets& w);
+    void     applyLED(QLabel* label, int value, const char* color);
+
+    // ── C++ implementation ─────────────────────────────────────────────────
+    MockSoC        soc_;
+    ThermalMonitor monitor_;
+    TabWidgets     cppW_;
+
+    // ── C implementation ───────────────────────────────────────────────────
+    CThermalMonitorAdapter cMonitor_;
+    TabWidgets             cW_;
+
+    QTimer* pollTimer_ = nullptr;
+};
+
+
+====================================================================================================
+FILE: platform/eeprom/mock_eeprom_file.hpp
+====================================================================================================
+
+#pragma once
+
+#include "../mock_file.hpp"
+#include "../../platform/linux_like_os.hpp"
+
+#include <vector>
+#include <cstring>
+#include <algorithm>
+
+class MockEepromFile final : public IMockFile {
+public:
+    explicit MockEepromFile(size_t size) : memory_(size, 0xff) {}
+
+    ssize_t read(void* buf, size_t n) override {
+        if (readOnly_ && false) {} // readOnly checked on write only
+        if (offset_ >= memory_.size()) return 0;
+        size_t count = std::min(n, memory_.size() - offset_);
+        std::memcpy(buf, memory_.data() + offset_, count);
+        offset_ += count;
+        return static_cast<ssize_t>(count);
+    }
+
+    ssize_t write(const void* buf, size_t n) override {
+        if (readOnly_) return -1;
+        if (offset_ >= memory_.size()) return 0;
+        size_t count = std::min(n, memory_.size() - offset_);
+        std::memcpy(memory_.data() + offset_, buf, count);
+        offset_ += count;
+        return static_cast<ssize_t>(count);
+    }
+
+    int ioctl(uint64_t, void*) override { return -1; }
+
+    off_t lseek(off_t offset, int whence) override {
+        off_t newOffset = 0;
+        switch (whence) {
+            case Seek_Set: newOffset = offset; break;
+            case Seek_Cur: newOffset = static_cast<off_t>(offset_) + offset; break;
+            case Seek_End: newOffset = static_cast<off_t>(memory_.size()) + offset; break;
+            default: return -1;
+        }
+        if (newOffset < 0 || static_cast<size_t>(newOffset) > memory_.size()) return -1;
+        offset_ = static_cast<size_t>(newOffset);
+        return static_cast<off_t>(offset_);
+    }
+
+    int close() override { return 0; }
+
+    void setByte(size_t offset, uint8_t value)  { memory_.at(offset) = value; }
+    uint8_t getByte(size_t offset) const         { return memory_.at(offset); }
+    void setReadOnly(bool ro)                    { readOnly_ = ro; }
+
+private:
+    std::vector<uint8_t> memory_;
+    size_t offset_ = 0;
+    bool readOnly_ = false;
+};
+
+
+====================================================================================================
+FILE: platform/gpio/mock_gpio_value_file.hpp
+====================================================================================================
+
+#pragma once
+
+#include "../mock_file.hpp"
+#include <mutex>
+#include <cstring>
+#include <algorithm>
+
+// Write-only sink — accepts any write, discards it (used for /export and /direction)
+class MockSinkFile final : public IMockFile {
+public:
+    ssize_t read(void*, size_t) override { return -1; }
+    ssize_t write(const void*, size_t n) override { return static_cast<ssize_t>(n); }
+    int   ioctl(unsigned long, void*) override { return -1; }
+    off_t lseek(off_t, int)          override { return -1; }
+    int   close()                    override { return 0; }
+};
+
+class MockGpioValueFile final : public IMockFile {
+public:
+    ssize_t read(void* buf, size_t n) override {
+        std::lock_guard lock(mutex_);
+        const char* v = value_ ? "1\n" : "0\n";
+        size_t len = std::min(n, size_t(2));
+        std::memcpy(buf, v, len);
+        return static_cast<ssize_t>(len);
+    }
+
+    ssize_t write(const void* buf, size_t n) override {
+        std::lock_guard lock(mutex_);
+        if (n > 0) value_ = (static_cast<const char*>(buf)[0] == '1');
+        return static_cast<ssize_t>(n);
+    }
+
+    int   ioctl(unsigned long, void*) override { return -1; }
+    off_t lseek(off_t, int)          override { return 0; }
+    int   close()                    override { return 0; }
+
+    int getValue() const {
+        std::lock_guard lock(mutex_);
+        return value_ ? 1 : 0;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    bool value_ = false;
+};
+
+
+====================================================================================================
+FILE: platform/i2c/i2c_types.hpp
+====================================================================================================
+
+#pragma once
+
+#include <cstdint>
+
+// Same values as Linux <linux/i2c-dev.h> — swap for real headers on target
+constexpr unsigned long I2C_SLAVE = 0x0703;
+constexpr unsigned long I2C_SMBUS = 0x0720;
+constexpr unsigned long I2C_RDWR  = 0x0707;
+constexpr uint16_t I2C_M_RD  = 0x0001;
+
+constexpr uint8_t I2C_SMBUS_WRITE      = 0;
+constexpr uint8_t I2C_SMBUS_READ       = 1;
+constexpr int     I2C_SMBUS_WORD_DATA  = 3;
+
+struct i2c_msg {
+    uint16_t addr;
+    uint16_t flags;
+    uint16_t len;
+    uint8_t* buf;
+};
+
+struct i2c_rdwr_data {
+    i2c_msg* msgs;
+    uint32_t nmsgs;
+};
+
+union i2c_smbus_data {
+    uint8_t  byte;
+    uint16_t word;
+    uint8_t  block[34];
+};
+
+struct i2c_smbus_ioctl_data {
+    uint8_t read_write;
+    uint8_t command;
+    int     size;
+    i2c_smbus_data* data;
+};
+
+
+====================================================================================================
+FILE: platform/i2c/mock_i2c_bus.hpp
+====================================================================================================
+
+#pragma once
+
+#include "mock_i2c_peripheral.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <unordered_map>
+
+class MockI2cBus {
+public:
+    void attach(uint16_t address, std::shared_ptr<IMockI2cPeripheral> device) {
+        devices_[address] = std::move(device);
+    }
+
+    bool write(uint16_t address, const uint8_t* data, size_t len) {
+        auto it = devices_.find(address);
+        return it != devices_.end() && it->second->write(data, len);
+    }
+
+    bool read(uint16_t address, uint8_t* out, size_t len) {
+        auto it = devices_.find(address);
+        return it != devices_.end() && it->second->read(out, len);
+    }
+
+private:
+    std::unordered_map<uint16_t, std::shared_ptr<IMockI2cPeripheral>> devices_;
+};
+
+
+====================================================================================================
+FILE: platform/i2c/mock_i2c_dev_file.hpp
+====================================================================================================
+
+#pragma once
+
+#include "../mock_file.hpp"
+#include "mock_i2c_bus.hpp"
+#include "i2c_types.hpp"
+
+class MockI2cDevFile final : public IMockFile {
+public:
+    explicit MockI2cDevFile(MockI2cBus& bus) : bus_(bus) {}
+
+    ssize_t read(void* buf, size_t n) override {
+        if (currentAddr_ < 0) return -1;
+        return bus_.read(static_cast<uint16_t>(currentAddr_),
+                         static_cast<uint8_t*>(buf), n) ? static_cast<ssize_t>(n) : -1;
+    }
+
+    ssize_t write(const void* buf, size_t n) override {
+        if (currentAddr_ < 0) return -1;
+        return bus_.write(static_cast<uint16_t>(currentAddr_),
+                          static_cast<const uint8_t*>(buf), n) ? static_cast<ssize_t>(n) : -1;
+    }
+
+    int ioctl(unsigned long request, void* arg) override {
+        switch (request) {
+            case I2C_SLAVE:
+                currentAddr_ = static_cast<int>(reinterpret_cast<uintptr_t>(arg));
+                return 0;
+            case I2C_RDWR:
+                return rdwr(*static_cast<i2c_rdwr_data*>(arg));
+            default:
+                return -1;
+        }
+    }
+
+    off_t lseek(off_t, int) override { return -1; }
+    int   close()          override { currentAddr_ = -1; return 0; }
+
+private:
+    int rdwr(i2c_rdwr_data& data) {
+        for (uint32_t i = 0; i < data.nmsgs; ++i) {
+            i2c_msg& msg = data.msgs[i];
+            bool ok = (msg.flags & I2C_M_RD)
+                ? bus_.read (msg.addr, msg.buf, msg.len)
+                : bus_.write(msg.addr, msg.buf, msg.len);
+            if (!ok) return -1;
+        }
+        return static_cast<int>(data.nmsgs);
+    }
+
+    MockI2cBus& bus_;
+    int currentAddr_ = -1;
+};
+
+
+====================================================================================================
+FILE: platform/i2c/mock_i2c_peripheral.hpp
+====================================================================================================
+
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+
+class IMockI2cPeripheral {
+public:
+    virtual ~IMockI2cPeripheral() = default;
+
+    virtual bool write(const uint8_t* data, size_t len) = 0;
+    virtual bool read (uint8_t* out,        size_t len) = 0;
+};
+
+
+====================================================================================================
+FILE: platform/linux_like_os.hpp
+====================================================================================================
+
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <string>
+#include <sys/types.h>
+
+using Fd = int;
+
+enum class OpenFlags : uint32_t {
+    ReadOnly  = 0,   // O_RDONLY
+    WriteOnly = 1,   // O_WRONLY
+    ReadWrite = 2,   // O_RDWR
+};
+
+// SEEK_SET / SEEK_CUR / SEEK_END — same values as POSIX
+inline constexpr int Seek_Set = 0;
+inline constexpr int Seek_Cur = 1;
+inline constexpr int Seek_End = 2;
+
+class ILinuxLikeOs {
+public:
+    virtual ~ILinuxLikeOs() = default;
+
+    virtual Fd      open  (const std::string& path, OpenFlags flags)              = 0;
+    virtual ssize_t read  (Fd fd, void* buf, size_t n)                            = 0;
+    virtual ssize_t write (Fd fd, const void* buf, size_t n)                      = 0;
+    virtual int     ioctl (Fd fd, unsigned long request, void* arg)               = 0;
+    virtual off_t   lseek (Fd fd, off_t offset, int whence)                       = 0;
+    virtual int     close (Fd fd)                                                  = 0;
+};
+
+
+====================================================================================================
+FILE: platform/mock_file.hpp
+====================================================================================================
+
+#pragma once
+
+#include <cstdint>
+#include <cstddef>
+#include <sys/types.h>
+
+class IMockFile {
+public:
+    virtual ~IMockFile() = default;
+
+    virtual ssize_t read  (void* buf, size_t n)             = 0;
+    virtual ssize_t write (const void* buf, size_t n)       = 0;
+    virtual int     ioctl (unsigned long request, void* arg) = 0;
+    virtual off_t   lseek (off_t offset, int whence)        = 0;
+    virtual int     close ()                                 = 0;
+};
+
+
+====================================================================================================
+FILE: platform/mock_linux_os.hpp
+====================================================================================================
+
+#pragma once
+
+#include "linux_like_os.hpp"
+#include "mock_file.hpp"
+
+#include <unordered_map>
+#include <memory>
+#include <mutex>
+
+class MockLinuxOs final : public ILinuxLikeOs {
+public:
+    void registerPath(const std::string& path, std::shared_ptr<IMockFile> file) {
+        std::lock_guard lock(mutex_);
+        pathRegistry_[path] = std::move(file);
+    }
+
+    Fd open(const std::string& path, OpenFlags) override {
+        std::lock_guard lock(mutex_);
+        auto it = pathRegistry_.find(path);
+        if (it == pathRegistry_.end()) return -1;
+        Fd fd = nextFd_++;
+        openFiles_[fd] = it->second;
+        return fd;
+    }
+
+    ssize_t read(Fd fd, void* buf, size_t n) override {
+        auto f = get(fd);
+        return f ? f->read(buf, n) : -1;
+    }
+
+    ssize_t write(Fd fd, const void* buf, size_t n) override {
+        auto f = get(fd);
+        return f ? f->write(buf, n) : -1;
+    }
+
+    int ioctl(Fd fd, unsigned long request, void* arg) override {
+        auto f = get(fd);
+        return f ? f->ioctl(request, arg) : -1;
+    }
+
+    off_t lseek(Fd fd, off_t offset, int whence) override {
+        auto f = get(fd);
+        return f ? f->lseek(offset, whence) : -1;
+    }
+
+    int close(Fd fd) override {
+        std::lock_guard lock(mutex_);
+        openFiles_.erase(fd);
+        return 0;
+    }
+
+private:
+    std::shared_ptr<IMockFile> get(Fd fd) {
+        std::lock_guard lock(mutex_);
+        auto it = openFiles_.find(fd);
+        return it != openFiles_.end() ? it->second : nullptr;
+    }
+
+    std::mutex mutex_;
+    Fd nextFd_ = 3;
+    std::unordered_map<std::string, std::shared_ptr<IMockFile>> pathRegistry_;
+    std::unordered_map<Fd, std::shared_ptr<IMockFile>> openFiles_;
+};
+
+
+====================================================================================================
+FILE: platform/real_linux_os.hpp
+====================================================================================================
+
+#pragma once
+
+#include "linux_like_os.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+
+// Wraps the actual Linux syscalls — OpenFlags values match O_RDONLY/O_WRONLY/O_RDWR exactly.
+class RealLinuxOs : public ILinuxLikeOs {
+public:
+    Fd open(const std::string& path, OpenFlags flags) override {
+        return ::open(path.c_str(), static_cast<int>(flags));
+    }
+    ssize_t read(Fd fd, void* buf, size_t n) override {
+        return ::read(fd, buf, n);
+    }
+    ssize_t write(Fd fd, const void* buf, size_t n) override {
+        return ::write(fd, buf, n);
+    }
+    int ioctl(Fd fd, unsigned long request, void* arg) override {
+        return ::ioctl(fd, request, arg);
+    }
+    off_t lseek(Fd fd, off_t offset, int whence) override {
+        return ::lseek(fd, offset, whence);
+    }
+    int close(Fd fd) override {
+        return ::close(fd);
+    }
+};
+
+
+====================================================================================================
+FILE: platform/soc/mock_soc.hpp
+====================================================================================================
+
+#pragma once
+
+#include "../mock_linux_os.hpp"
+#include "../i2c/mock_i2c_bus.hpp"
+#include "../i2c/mock_i2c_peripheral.hpp"
+#include "../i2c/mock_i2c_dev_file.hpp"
+#include "../eeprom/mock_eeprom_file.hpp"
+#include "../gpio/mock_gpio_value_file.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+class MockTempSensorPeripheral final : public IMockI2cPeripheral {
+public:
+    void setRawValue(int16_t v) {
+        std::lock_guard lock(mutex_);
+        sequence_.clear();
+        sequenceIndex_ = 0;
+        setRawValueLocked(v);
+        error_ = false;
+    }
+
+    void setRawSequence(std::vector<int16_t> values) {
+        std::lock_guard lock(mutex_);
+        sequence_ = std::move(values);
+        sequenceIndex_ = 0;
+        if (!sequence_.empty()) setRawValueLocked(sequence_.front());
+        error_ = false;
+    }
+
+    void injectError(bool err) {
+        std::lock_guard lock(mutex_);
+        error_ = err;
+    }
+
+    bool write(const uint8_t* data, size_t len) override {
+        std::lock_guard lock(mutex_);
+        if (error_) return false;
+        if (len >= 1) regPtr_ = data[0];
+        return true;
+    }
+
+    bool read(uint8_t* out, size_t len) override {
+        std::lock_guard lock(mutex_);
+        if (error_) return false;
+        if (regPtr_ == 0 && !sequence_.empty()) {
+            const int16_t value = sequence_[sequenceIndex_];
+            setRawValueLocked(value);
+            if (sequenceIndex_ + 1 < sequence_.size()) ++sequenceIndex_;
+        }
+        for (size_t i = 0; i < len; ++i)
+            out[i] = regs_[regPtr_++];
+        return true;
+    }
+
+private:
+    void setRawValueLocked(int16_t v) {
+        regs_[0] = static_cast<uint8_t>(v >> 8);
+        regs_[1] = static_cast<uint8_t>(v & 0xFF);
+    }
+
+    uint8_t regs_[256]{};
+    uint8_t regPtr_ = 0;
+    bool error_ = false;
+    std::vector<int16_t> sequence_;
+    size_t sequenceIndex_ = 0;
+    std::mutex mutex_;
+};
+
+struct MockSoC {
+    MockLinuxOs os;
+    MockI2cBus  i2cBus;
+
+    std::shared_ptr<MockTempSensorPeripheral> tempSensor;
+    std::shared_ptr<MockEepromFile>           eepromFile;
+    std::shared_ptr<MockGpioValueFile>        gpioGreen;
+    std::shared_ptr<MockGpioValueFile>        gpioYellow;
+    std::shared_ptr<MockGpioValueFile>        gpioRed;
+
+    MockSoC() {
+        tempSensor = std::make_shared<MockTempSensorPeripheral>();
+        i2cBus.attach(0x48, tempSensor);
+        os.registerPath("/dev/i2c-1", std::make_shared<MockI2cDevFile>(i2cBus));
+
+        eepromFile = std::make_shared<MockEepromFile>(256);
+        eepromFile->setByte(0, 0x00);
+        os.registerPath("/sys/bus/nvmem/devices/eeprom0/nvmem", eepromFile);
+
+        gpioGreen  = std::make_shared<MockGpioValueFile>();
+        gpioYellow = std::make_shared<MockGpioValueFile>();
+        gpioRed    = std::make_shared<MockGpioValueFile>();
+        os.registerPath("/sys/class/gpio/gpio10/value",  gpioGreen);
+        os.registerPath("/sys/class/gpio/gpio11/value",  gpioYellow);
+        os.registerPath("/sys/class/gpio/gpio12/value",  gpioRed);
+
+        // Export and direction — write-only sinks, no state needed in tests
+        auto exportFile = std::make_shared<MockSinkFile>();
+        os.registerPath("/sys/class/gpio/export",              exportFile);
+        os.registerPath("/sys/class/gpio/gpio10/direction", std::make_shared<MockSinkFile>());
+        os.registerPath("/sys/class/gpio/gpio11/direction", std::make_shared<MockSinkFile>());
+        os.registerPath("/sys/class/gpio/gpio12/direction", std::make_shared<MockSinkFile>());
+    }
+};
+
+
+====================================================================================================
+FILE: qemu/README.md
+====================================================================================================
+
+# QEMU Test VM
+
+This directory contains the reproducible QEMU VM setup for the hardware integration test.
+
+Large generated VM artifacts are intentionally not committed:
+
+- `debian12-base.qcow2`
+- `debian12.qcow2`
+- `cloud-init.iso`
+- `vm_key`
+- logs
+
+## Build The VM Image
+
+Install host tools:
+
+```bash
+sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client
+```
+
+Then create the VM image:
+
+```bash
+qemu/create-vm-image.sh
+```
+
+The script downloads the Debian 12 generic cloud image, creates a local qcow2 overlay, generates an SSH key, writes cloud-init user data, and creates `cloud-init.iso`. It does not boot the VM.
+
+The Debian VM installs the packages needed by this project through cloud-init:
+
+- build tools
+- CMake
+- Qt 6 development package
+- GoogleTest development package
+- kernel headers
+- rsync/git
+
+## Clean Generated VM Artifacts
+
+Remove all generated VM files and keys:
+
+```bash
+qemu/clean.sh
+```
+
+Keep the downloaded Debian base image to avoid downloading it again:
+
+```bash
+qemu/clean.sh --keep-base
+```
+
+## Provision The VM
+
+Run the first boot and verify the test dependencies:
+
+```bash
+qemu/provision-vm.sh
+```
+
+This waits for cloud-init, installs and checks the required packages, verifies kernel headers, loads `i2c-dev` and `i2c-stub`, builds `tools/gpio_sysfs_mock/thermal_gpio_mock.ko`, loads it once, checks GPIO 10/11/12, and shuts the VM down.
+
+The Debian generic cloud image initially boots a `cloud-amd64` kernel that may not provide `i2c-dev`. The provision script installs `linux-image-amd64`, configures GRUB to boot that standard Debian kernel, reboots, and then verifies I2C and kernel module support.
+
+First boot can take a few minutes because cloud-init installs packages.
+
+## Launch VM Manually
+
+```bash
+qemu/launch-vm.sh
+```
+
+This only launches the VM. It does not run the project tests.
+
+Then connect:
+
+```bash
+ssh -i qemu/vm_key -p 2222 -o StrictHostKeyChecking=no dev@localhost
+```
+
+## Run Integration Test
+
+From the repository root:
+
+```bash
+scripts/run_qemu_hw_integration.sh
+```
+
+This script launches the VM, syncs the repository, builds the project inside the VM, runs the unit tests and hardware demos, then shuts the VM down.
+
+The integration script defaults to `qemu/` relative to the repository root. You can still override it:
+
+```bash
+QEMU_DIR=/path/to/qemu-dir scripts/run_qemu_hw_integration.sh
+```
+
+
+====================================================================================================
+FILE: qemu/clean.sh
+====================================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+KEEP_BASE=0
+if [ "${1:-}" = "--keep-base" ]; then
+    KEEP_BASE=1
+elif [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    cat <<EOF
+Usage: qemu/clean.sh [--keep-base]
+
+Remove generated QEMU VM artifacts.
+
+Options:
+  --keep-base  Keep debian12-base.qcow2 to avoid downloading it again.
+EOF
+    exit 0
+elif [ "${1:-}" != "" ]; then
+    echo "ERROR: unknown option: $1" >&2
+    echo "Run: qemu/clean.sh --help" >&2
+    exit 1
+fi
+
+rm -f \
+    "$SCRIPT_DIR/debian12.qcow2" \
+    "$SCRIPT_DIR/cloud-init.iso" \
+    "$SCRIPT_DIR/user-data" \
+    "$SCRIPT_DIR/vm_key" \
+    "$SCRIPT_DIR/vm_key.pub" \
+    "$SCRIPT_DIR/known_hosts" \
+    "$SCRIPT_DIR"/*.log
+
+if [ "$KEEP_BASE" -eq 0 ]; then
+    rm -f "$SCRIPT_DIR/debian12-base.qcow2"
+fi
+
+echo "QEMU generated artifacts removed."
+if [ "$KEEP_BASE" -eq 1 ]; then
+    echo "Kept: $SCRIPT_DIR/debian12-base.qcow2"
+fi
+
+
+====================================================================================================
+FILE: qemu/create-vm-image.sh
+====================================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+DEBIAN_IMAGE_URL="${DEBIAN_IMAGE_URL:-https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2}"
+BASE_IMAGE="${BASE_IMAGE:-$SCRIPT_DIR/debian12-base.qcow2}"
+VM_IMAGE="${VM_IMAGE:-$SCRIPT_DIR/debian12.qcow2}"
+VM_SIZE="${VM_SIZE:-8G}"
+VM_KEY="${VM_KEY:-$SCRIPT_DIR/vm_key}"
+USER_DATA_TEMPLATE="${USER_DATA_TEMPLATE:-$SCRIPT_DIR/user-data.template}"
+USER_DATA="${USER_DATA:-$SCRIPT_DIR/user-data}"
+META_DATA="${META_DATA:-$SCRIPT_DIR/meta-data}"
+CLOUD_INIT_ISO="${CLOUD_INIT_ISO:-$SCRIPT_DIR/cloud-init.iso}"
+
+need_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: missing command: $1" >&2
+        return 1
+    fi
+}
+
+need_cmd qemu-img
+need_cmd ssh-keygen
+
+if command -v cloud-localds >/dev/null 2>&1; then
+    ISO_CMD=(cloud-localds "$CLOUD_INIT_ISO" "$USER_DATA" "$META_DATA")
+elif command -v genisoimage >/dev/null 2>&1; then
+    ISO_CMD=(genisoimage -output "$CLOUD_INIT_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA")
+elif command -v xorriso >/dev/null 2>&1; then
+    ISO_CMD=(xorriso -as mkisofs -output "$CLOUD_INIT_ISO" -volid cidata -joliet -rock "$USER_DATA" "$META_DATA")
+else
+    echo "ERROR: need cloud-localds, genisoimage, or xorriso to create cloud-init.iso" >&2
+    echo "Debian/Ubuntu package options: cloud-image-utils, genisoimage, or xorriso" >&2
+    exit 1
+fi
+
+if [ ! -f "$VM_KEY" ]; then
+    ssh-keygen -t ed25519 -N "" -f "$VM_KEY" -C "embedded-demo"
+fi
+
+if [ ! -f "$BASE_IMAGE" ]; then
+    if command -v curl >/dev/null 2>&1; then
+        curl -L "$DEBIAN_IMAGE_URL" -o "$BASE_IMAGE"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$BASE_IMAGE" "$DEBIAN_IMAGE_URL"
+    else
+        echo "ERROR: need curl or wget to download Debian cloud image" >&2
+        exit 1
+    fi
+fi
+
+if [ ! -f "$VM_IMAGE" ]; then
+    qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$VM_IMAGE" "$VM_SIZE"
+fi
+
+PUBLIC_KEY="$(cat "$VM_KEY.pub")"
+sed "s|__SSH_PUBLIC_KEY__|$PUBLIC_KEY|" "$USER_DATA_TEMPLATE" > "$USER_DATA"
+"${ISO_CMD[@]}"
+
+echo "Created VM image setup:"
+echo "  image:       $VM_IMAGE"
+echo "  cloud-init:  $CLOUD_INIT_ISO"
+echo "  ssh key:     $VM_KEY"
+echo
+echo "Next step:"
+echo "  qemu/provision-vm.sh"
+echo
+echo "After provisioning, run:"
+echo "  scripts/run_qemu_hw_integration.sh"
+
+
+====================================================================================================
+FILE: qemu/launch-vm.sh
+====================================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+IMAGE="${IMAGE:-$SCRIPT_DIR/debian12.qcow2}"
+CLOUD_INIT_ISO="${CLOUD_INIT_ISO:-$SCRIPT_DIR/cloud-init.iso}"
+VM_PORT="${VM_PORT:-2222}"
+VM_MEMORY="${VM_MEMORY:-2048}"
+VM_CPUS="${VM_CPUS:-2}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+
+if [ ! -f "$IMAGE" ]; then
+    echo "ERROR: VM image not found: $IMAGE" >&2
+    echo "Run: qemu/create-vm-image.sh" >&2
+    exit 1
+fi
+
+if [ ! -f "$CLOUD_INIT_ISO" ]; then
+    echo "ERROR: cloud-init ISO not found: $CLOUD_INIT_ISO" >&2
+    echo "Run: qemu/create-vm-image.sh" >&2
+    exit 1
+fi
+
+KVM_ARGS=()
+if [ -e /dev/kvm ]; then
+    KVM_ARGS=(-enable-kvm -cpu host)
+else
+    KVM_ARGS=(-cpu max)
+fi
+
+exec "$QEMU_BIN" \
+  -name "embedded-demo" \
+  -m "$VM_MEMORY" \
+  -smp "$VM_CPUS" \
+  "${KVM_ARGS[@]}" \
+  -drive file="$IMAGE",format=qcow2,if=virtio \
+  -drive file="$CLOUD_INIT_ISO",format=raw,if=virtio,readonly=on \
+  -netdev user,id=net0,hostfwd=tcp::"$VM_PORT"-:22 \
+  -device virtio-net-pci,netdev=net0 \
+  -nographic \
+  -serial mon:stdio
+
+
+====================================================================================================
+FILE: qemu/meta-data
+====================================================================================================
+
+instance-id: embedded-demo
+local-hostname: embedded-demo
+
+
+====================================================================================================
+FILE: qemu/provision-vm.sh
+====================================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QEMU_DIR="${QEMU_DIR:-$REPO_DIR/qemu}"
+VM_KEY="${VM_KEY:-$QEMU_DIR/vm_key}"
+VM_USER="${VM_USER:-dev}"
+VM_HOST="${VM_HOST:-localhost}"
+VM_PORT="${VM_PORT:-2222}"
+VM_PROJECT_DIR="${VM_PROJECT_DIR:-/home/dev/embedded_bewerbung}"
+KNOWN_HOSTS="${KNOWN_HOSTS:-/tmp/qemu_provision_known_hosts}"
+QEMU_LOG="${QEMU_LOG:-/tmp/qemu_provision.log}"
+
+SSH_BASE=(
+    ssh
+    -i "$VM_KEY"
+    -p "$VM_PORT"
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile="$KNOWN_HOSTS"
+)
+SSH_TARGET="$VM_USER@$VM_HOST"
+rm -f "$KNOWN_HOSTS"
+
+wait_for_ssh() {
+    echo "Waiting for SSH on $VM_HOST:$VM_PORT..."
+    for _ in $(seq 1 120); do
+        if "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "echo ready" >/dev/null 2>&1; then
+            "${SSH_BASE[@]}" -o ConnectTimeout=5 "$SSH_TARGET" "echo ready" >/dev/null
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: SSH did not become ready." >&2
+    return 1
+}
+
+wait_for_cloud_init() {
+    echo "Waiting for cloud-init..."
+    "${SSH_BASE[@]}" "$SSH_TARGET" "if command -v cloud-init >/dev/null 2>&1; then sudo cloud-init status --wait; fi"
+}
+
+if [ ! -f "$QEMU_DIR/launch-vm.sh" ]; then
+    echo "ERROR: missing QEMU launcher: $QEMU_DIR/launch-vm.sh" >&2
+    echo "Run qemu/create-vm-image.sh first." >&2
+    exit 1
+fi
+
+if [ ! -f "$VM_KEY" ]; then
+    echo "ERROR: missing VM SSH key: $VM_KEY" >&2
+    echo "Run qemu/create-vm-image.sh first." >&2
+    exit 1
+fi
+
+cleanup() {
+    if "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "true" >/dev/null 2>&1; then
+        "${SSH_BASE[@]}" "$SSH_TARGET" "sudo poweroff" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+echo "Starting QEMU VM for provisioning..."
+setsid bash "$QEMU_DIR/launch-vm.sh" >"$QEMU_LOG" 2>&1 &
+QEMU_PID=$!
+echo "QEMU launcher PID: $QEMU_PID"
+echo "QEMU log: $QEMU_LOG"
+
+wait_for_ssh
+wait_for_cloud_init
+
+echo "Installing and verifying VM dependencies..."
+"${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    rsync \
+    pkg-config \
+    qt6-base-dev \
+    libgtest-dev \
+    linux-image-amd64 \
+    linux-headers-amd64
+sudo apt-get install -y linux-headers-\$(uname -r) || true
+
+command -v cmake
+command -v make
+command -v gcc
+command -v g++
+command -v rsync
+pkg-config --exists Qt6Core
+test -d /lib/modules/\$(uname -r)/build
+"
+
+TARGET_KERNEL="$("${SSH_BASE[@]}" "$SSH_TARGET" "ls /boot/vmlinuz-*-amd64 2>/dev/null | sed 's|.*/vmlinuz-||' | grep -v cloud | sort -V | tail -1")"
+CURRENT_KERNEL="$("${SSH_BASE[@]}" "$SSH_TARGET" "uname -r")"
+
+if [ -n "$TARGET_KERNEL" ] && [ "$CURRENT_KERNEL" != "$TARGET_KERNEL" ]; then
+    echo "Configuring GRUB to boot $TARGET_KERNEL instead of $CURRENT_KERNEL..."
+    "${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+MENU='Advanced options for Debian GNU/Linux>Debian GNU/Linux, with Linux $TARGET_KERNEL'
+if grep -q '^GRUB_DEFAULT=' /etc/default/grub; then
+    sudo sed -i \"s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\\\"\$MENU\\\"|\" /etc/default/grub
+else
+    echo \"GRUB_DEFAULT=\\\"\$MENU\\\"\" | sudo tee -a /etc/default/grub >/dev/null
+fi
+sudo update-grub
+"
+    echo "Rebooting into $TARGET_KERNEL..."
+    "${SSH_BASE[@]}" "$SSH_TARGET" "sudo reboot" >/dev/null 2>&1 || true
+    sleep 5
+    wait_for_ssh
+    wait_for_cloud_init
+    "${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+sudo apt-get update
+sudo apt-get install -y linux-headers-\$(uname -r)
+test -d /lib/modules/\$(uname -r)/build
+"
+fi
+
+echo "Verifying I2C kernel modules..."
+"${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+sudo modprobe i2c-dev
+sudo modprobe -r i2c-stub 2>/dev/null || true
+sudo modprobe i2c-stub chip_addr=0x48
+ls /dev/i2c-* >/dev/null
+"
+
+echo "Syncing repository to VM for kernel module verification..."
+rsync -az --delete \
+    --exclude build \
+    --exclude CMakeLists.txt.user \
+    --exclude qemu/debian12-base.qcow2 \
+    --exclude qemu/debian12.qcow2 \
+    --exclude qemu/cloud-init.iso \
+    --exclude qemu/vm_key \
+    --exclude qemu/vm_key.pub \
+    --exclude qemu/user-data \
+    --exclude qemu/*.log \
+    -e "ssh -i $VM_KEY -p $VM_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=$KNOWN_HOSTS" \
+    "$REPO_DIR/" "$SSH_TARGET:$VM_PROJECT_DIR/"
+
+echo "Building and loading GPIO kernel module once..."
+"${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+cd '$VM_PROJECT_DIR/tools/gpio_sysfs_mock'
+make clean
+make
+sudo rmmod thermal_gpio_mock 2>/dev/null || true
+sudo insmod thermal_gpio_mock.ko
+for n in 10 11 12; do
+    if [ ! -d /sys/class/gpio/gpio\$n ]; then
+        echo \$n | sudo tee /sys/class/gpio/export >/dev/null
+    fi
+done
+test -e /sys/class/gpio/gpio10/value
+test -e /sys/class/gpio/gpio11/value
+test -e /sys/class/gpio/gpio12/value
+sudo rmmod thermal_gpio_mock
+"
+
+echo "Provisioning passed. Shutting VM down..."
+cleanup
+trap - EXIT
+
+echo "Waiting for VM shutdown..."
+for _ in $(seq 1 60); do
+    if ! "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "true" >/dev/null 2>&1; then
+        echo "VM is provisioned and down."
+        echo
+        echo "Next step:"
+        echo "  scripts/run_qemu_hw_integration.sh"
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "WARNING: VM did not shut down within timeout." >&2
+exit 1
+
+
+====================================================================================================
+FILE: qemu/user-data.template
+====================================================================================================
+
+#cloud-config
+users:
+  - name: dev
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+    lock_passwd: true
+ssh_pwauth: false
+package_update: true
+packages:
+  - build-essential
+  - cmake
+  - git
+  - rsync
+  - pkg-config
+  - qt6-base-dev
+  - libgtest-dev
+  - linux-image-amd64
+  - linux-headers-amd64
+runcmd:
+  - [ bash, -lc, "apt-get install -y linux-headers-$(uname -r) || true" ]
+  - [ bash, -lc, "modprobe i2c-dev || true" ]
+final_message: "embedded-demo cloud-init setup complete"
+
+
+====================================================================================================
+FILE: scripts/collect_source.py
+====================================================================================================
+
+#!/usr/bin/env python3
+"""Collect project source files into one text file with file-name headers."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+
+DEFAULT_OUTPUT = "source_bundle.txt"
+
+INCLUDED_SUFFIXES = {
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cmake",
+    ".md",
+    ".py",
+    ".sh",
+    ".template",
+    ".txt",
+}
+
+INCLUDED_NAMES = {
+    "CMakeLists.txt",
+    "Makefile",
+    "meta-data",
+}
+
+EXCLUDED_DIRS = {
+    ".git",
+    ".codex",
+    ".agents",
+    ".claude",
+    "build",
+    "__pycache__",
+}
+
+EXCLUDED_FILES = {
+    DEFAULT_OUTPUT,
+    "CMakeLists.txt.user",
+}
+
+
+def should_include(path: Path, root: Path, output: Path) -> bool:
+    rel = path.relative_to(root)
+    if any(part in EXCLUDED_DIRS for part in rel.parts):
+        return False
+    if path.resolve() == output.resolve():
+        return False
+    if path.name in EXCLUDED_FILES:
+        return False
+    return path.name in INCLUDED_NAMES or path.suffix in INCLUDED_SUFFIXES
+
+
+def collect_files(root: Path, output: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and should_include(path, root, output)
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Collect project source files into one text file."
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_OUTPUT,
+        help=f"output file path, default: {DEFAULT_OUTPUT}",
+    )
+    parser.add_argument(
+        "--root",
+        default=".",
+        help="project root, default: current directory",
+    )
+    args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    output = Path(args.output)
+    if not output.is_absolute():
+        output = root / output
+
+    files = collect_files(root, output)
+
+    with output.open("w", encoding="utf-8") as out:
+        out.write(f"Source bundle for: {root}\n")
+        out.write(f"Files: {len(files)}\n\n")
+
+        for path in files:
+            rel = path.relative_to(root)
+            out.write("=" * 100 + "\n")
+            out.write(f"FILE: {rel}\n")
+            out.write("=" * 100 + "\n\n")
+            try:
+                out.write(path.read_text(encoding="utf-8"))
+            except UnicodeDecodeError:
+                out.write(path.read_text(encoding="utf-8", errors="replace"))
+            out.write("\n\n")
+
+    print(f"Wrote {len(files)} files to {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+====================================================================================================
+FILE: scripts/readme_to_pdf.py
+====================================================================================================
+
+#!/usr/bin/env python3
+"""Render docs/README.md to a simple PDF without external PDF tools."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import textwrap
+from pathlib import Path
+
+
+PAGE_W = 595
+PAGE_H = 842
+MARGIN = 54
+CONTENT_W = PAGE_W - (2 * MARGIN)
+
+
+def pdf_hex(text: str) -> str:
+    data = text.encode("cp1252", errors="replace")
+    return "<" + data.hex().upper() + ">"
+
+
+def text_width(text: str, font_size: int) -> float:
+    return len(text) * font_size * 0.52
+
+
+def wrap_text(text: str, font_size: int, indent: int = 0) -> list[str]:
+    usable = max(20, CONTENT_W - indent)
+    chars = max(20, int(usable / (font_size * 0.52)))
+    return textwrap.wrap(text, width=chars, replace_whitespace=False) or [""]
+
+
+def strip_inline_markdown(text: str) -> str:
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    return text
+
+
+class PdfWriter:
+    def __init__(self) -> None:
+        self.pages: list[list[str]] = []
+        self.current: list[str] = []
+        self.y = PAGE_H - MARGIN
+
+    def new_page(self) -> None:
+        if self.current:
+            self.pages.append(self.current)
+        self.current = []
+        self.y = PAGE_H - MARGIN
+
+    def ensure_space(self, height: int) -> None:
+        if self.y - height < MARGIN:
+            self.new_page()
+
+    def add_line(self, text: str, font: str = "F1", size: int = 10, indent: int = 0) -> None:
+        line_height = int(size * 1.35)
+        self.ensure_space(line_height)
+        x = MARGIN + indent
+        self.current.append(f"BT /{font} {size} Tf {x} {self.y} Td {pdf_hex(text)} Tj ET")
+        self.y -= line_height
+
+    def add_wrapped(self, text: str, font: str = "F1", size: int = 10, indent: int = 0) -> None:
+        for line in wrap_text(text, size, indent):
+            self.add_line(line, font, size, indent)
+
+    def add_space(self, height: int) -> None:
+        self.ensure_space(height)
+        self.y -= height
+
+    def add_rule(self) -> None:
+        self.ensure_space(12)
+        self.current.append(f"{MARGIN} {self.y} m {PAGE_W - MARGIN} {self.y} l S")
+        self.y -= 12
+
+    def finish(self) -> bytes:
+        if self.current or not self.pages:
+            self.pages.append(self.current)
+
+        objects: list[bytes] = []
+
+        def add(obj: str | bytes) -> int:
+            if isinstance(obj, str):
+                obj = obj.encode("latin-1")
+            objects.append(obj)
+            return len(objects)
+
+        catalog_id = add("<< /Type /Catalog /Pages 2 0 R >>")
+        pages_id = 2
+        add(b"")
+        font_helvetica_id = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        font_bold_id = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>")
+        font_courier_id = add("<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>")
+
+        page_ids: list[int] = []
+        for page in self.pages:
+            content = "\n".join(page).encode("latin-1")
+            content_id = add(
+                b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n"
+                + content
+                + b"\nendstream"
+            )
+            page_id = add(
+                f"<< /Type /Page /Parent {pages_id} 0 R "
+                f"/MediaBox [0 0 {PAGE_W} {PAGE_H}] "
+                f"/Resources << /Font << /F1 {font_helvetica_id} 0 R "
+                f"/F2 {font_bold_id} 0 R /F3 {font_courier_id} 0 R >> >> "
+                f"/Contents {content_id} 0 R >>"
+            )
+            page_ids.append(page_id)
+
+        kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+        objects[pages_id - 1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode("latin-1")
+
+        out = bytearray(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")
+        offsets = [0]
+        for idx, obj in enumerate(objects, start=1):
+            offsets.append(len(out))
+            out.extend(f"{idx} 0 obj\n".encode("ascii"))
+            out.extend(obj)
+            out.extend(b"\nendobj\n")
+
+        xref = len(out)
+        out.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+        out.extend(b"0000000000 65535 f \n")
+        for offset in offsets[1:]:
+            out.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+        out.extend(
+            f"trailer\n<< /Size {len(objects) + 1} /Root {catalog_id} 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF\n".encode("ascii")
+        )
+        return bytes(out)
+
+
+def render_markdown(markdown: str) -> bytes:
+    pdf = PdfWriter()
+    in_code = False
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+
+        if line.startswith("```"):
+            in_code = not in_code
+            pdf.add_space(6)
+            continue
+
+        if in_code:
+            pdf.add_wrapped(line, font="F3", size=8)
+            continue
+
+        if not line.strip():
+            pdf.add_space(7)
+            continue
+
+        if line.startswith("# "):
+            pdf.add_wrapped(strip_inline_markdown(line[2:]), font="F2", size=20)
+            pdf.add_rule()
+            continue
+        if line.startswith("## "):
+            pdf.add_space(8)
+            pdf.add_wrapped(strip_inline_markdown(line[3:]), font="F2", size=15)
+            continue
+        if line.startswith("### "):
+            pdf.add_space(5)
+            pdf.add_wrapped(strip_inline_markdown(line[4:]), font="F2", size=12)
+            continue
+
+        if line.startswith("- "):
+            pdf.add_wrapped("- " + strip_inline_markdown(line[2:]), size=10, indent=12)
+            continue
+
+        if re.match(r"^\d+\. ", line):
+            pdf.add_wrapped(strip_inline_markdown(line), size=10, indent=12)
+            continue
+
+        if line.startswith("|"):
+            pdf.add_wrapped(line, font="F3", size=8)
+            continue
+
+        pdf.add_wrapped(strip_inline_markdown(line), size=10)
+
+    return pdf.finish()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Render docs/README.md to docs/README.pdf.")
+    parser.add_argument("--input", default="docs/README.md", help="Markdown input file")
+    parser.add_argument("--output", default="docs/README.pdf", help="PDF output file")
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    markdown = input_path.read_text(encoding="utf-8")
+    output_path.write_bytes(render_markdown(markdown))
+    print(f"Wrote {output_path} from {input_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+====================================================================================================
+FILE: scripts/run_qemu_hw_integration.sh
+====================================================================================================
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QEMU_DIR="${QEMU_DIR:-$REPO_DIR/qemu}"
+VM_KEY="${VM_KEY:-$QEMU_DIR/vm_key}"
+VM_USER="${VM_USER:-dev}"
+VM_HOST="${VM_HOST:-localhost}"
+VM_PORT="${VM_PORT:-2222}"
+VM_PROJECT_DIR="${VM_PROJECT_DIR:-/home/dev/embedded_bewerbung}"
+KNOWN_HOSTS="${KNOWN_HOSTS:-/tmp/qemu_hw_known_hosts}"
+QEMU_LOG="${QEMU_LOG:-/tmp/qemu_hw_integration.log}"
+
+SSH_BASE=(
+    ssh
+    -i "$VM_KEY"
+    -p "$VM_PORT"
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile="$KNOWN_HOSTS"
+)
+SSH_TARGET="$VM_USER@$VM_HOST"
+rm -f "$KNOWN_HOSTS"
+
+if [ ! -f "$QEMU_DIR/launch-vm.sh" ]; then
+    echo "ERROR: missing QEMU launcher: $QEMU_DIR/launch-vm.sh" >&2
+    echo "Run qemu/create-vm-image.sh or set QEMU_DIR=/path/to/existing/qemu-dir." >&2
+    exit 1
+fi
+
+if [ ! -f "$VM_KEY" ]; then
+    echo "ERROR: missing VM SSH key: $VM_KEY" >&2
+    echo "Run qemu/create-vm-image.sh or set VM_KEY=/path/to/key." >&2
+    exit 1
+fi
+
+cleanup() {
+    if "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "true" >/dev/null 2>&1; then
+        "${SSH_BASE[@]}" "$SSH_TARGET" "sudo poweroff" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+echo "Starting QEMU VM..."
+setsid bash "$QEMU_DIR/launch-vm.sh" >"$QEMU_LOG" 2>&1 &
+QEMU_PID=$!
+echo "QEMU launcher PID: $QEMU_PID"
+echo "QEMU log: $QEMU_LOG"
+
+echo "Waiting for SSH on $VM_HOST:$VM_PORT..."
+for _ in $(seq 1 90); do
+    if "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "echo ready" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 2
+done
+
+"${SSH_BASE[@]}" -o ConnectTimeout=5 "$SSH_TARGET" "echo ready" >/dev/null
+
+echo "Waiting for cloud-init, if present..."
+"${SSH_BASE[@]}" "$SSH_TARGET" "if command -v cloud-init >/dev/null 2>&1; then sudo cloud-init status --wait; fi"
+
+echo "Syncing project to VM..."
+rsync -az --delete \
+    --exclude build \
+    --exclude CMakeLists.txt.user \
+    --exclude qemu/debian12-base.qcow2 \
+    --exclude qemu/debian12.qcow2 \
+    --exclude qemu/cloud-init.iso \
+    --exclude qemu/vm_key \
+    --exclude qemu/vm_key.pub \
+    --exclude qemu/user-data \
+    --exclude qemu/*.log \
+    -e "ssh -i $VM_KEY -p $VM_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=$KNOWN_HOSTS" \
+    "$REPO_DIR/" "$SSH_TARGET:$VM_PROJECT_DIR/"
+
+echo "Running hardware integration test in VM..."
+"${SSH_BASE[@]}" "$SSH_TARGET" "set -eu
+cd '$VM_PROJECT_DIR'
+
+cd tools/gpio_sysfs_mock
+make clean
+make
+cd ../..
+
+sudo rmmod thermal_gpio_mock 2>/dev/null || true
+sudo insmod tools/gpio_sysfs_mock/thermal_gpio_mock.ko
+for n in 10 11 12; do
+    if [ ! -d /sys/class/gpio/gpio\$n ]; then
+        echo \$n | sudo tee /sys/class/gpio/export >/dev/null
+    fi
+done
+
+sudo modprobe -r i2c-stub 2>/dev/null || true
+sudo modprobe i2c-dev
+sudo modprobe i2c-stub chip_addr=0x48
+
+cmake -S . -B build -DBUILD_TESTS=ON
+cmake --build build -j\$(nproc)
+ctest --test-dir build --output-on-failure
+
+sudo ./build/demo_real_hw
+sudo ./build/c_impl/thermal_monitor_c_demo_real
+"
+
+echo "Hardware integration test passed."
+cleanup
+trap - EXIT
+
+echo "Waiting for VM shutdown..."
+for _ in $(seq 1 30); do
+    if ! "${SSH_BASE[@]}" -o ConnectTimeout=2 "$SSH_TARGET" "true" >/dev/null 2>&1; then
+        echo "VM is down."
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "WARNING: VM did not shut down within timeout." >&2
+exit 1
+
+
+====================================================================================================
+FILE: tests/thermal_monitor_test.cpp
+====================================================================================================
+
+#include <gtest/gtest.h>
+#include "thermal_monitor.h"
+#include "platform/soc/mock_soc.hpp"
+#include "platform/mock_linux_os.hpp"
+#include "platform/i2c/mock_i2c_bus.hpp"
+#include "platform/i2c/mock_i2c_dev_file.hpp"
+#include "platform/gpio/mock_gpio_value_file.hpp"
+
+#include <thread>
+#include <chrono>
+
+static constexpr auto TEST_POLL = std::chrono::milliseconds{10};
+static constexpr auto SETTLE    = std::chrono::milliseconds{25};
+
+class ThermalMonitorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        monitor = std::make_unique<ThermalMonitor>(soc.os, TEST_POLL);
+    }
+
+    void TearDown() override {
+        monitor->stop();
+    }
+
+    bool checkLEDs(bool g, bool y, bool r) {
+        return soc.gpioGreen->getValue()  == (g ? 1 : 0) &&
+               soc.gpioYellow->getValue() == (y ? 1 : 0) &&
+               soc.gpioRed->getValue()    == (r ? 1 : 0);
+    }
+
+    MockSoC soc;
+    std::unique_ptr<ThermalMonitor> monitor;
+};
+
+TEST_F(ThermalMonitorTest, TypeAThresholds) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeA_1_Per_Unit));
+
+    soc.tempSensor->setRawValue(84);
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "84 degC should be Green";
+
+    soc.tempSensor->setRawValue(85);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85 degC should be Yellow";
+
+    soc.tempSensor->setRawValue(105);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105 degC should be Red";
+
+    // Boundary at CRIT_LO: exactly 5 degC (50 deci-degC) -> Green, not Red
+    soc.tempSensor->setRawValue(5);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "5 degC (CRIT_LO boundary) should be Green";
+
+    // Below CRIT_LO: 4 degC -> Red
+    soc.tempSensor->setRawValue(4);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4 degC should be Red";
+
+    // Just below CRIT_HI: 104 degC (1040 deci-degC) -> Yellow, not Red
+    soc.tempSensor->setRawValue(104);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "104 degC (below CRIT_HI) should be Yellow";
+}
+
+TEST_F(ThermalMonitorTest, TypeBThresholds) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeB_0_1_Per_Unit));
+
+    soc.tempSensor->setRawValue(849);
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "84.9 degC should be Green";
+
+    soc.tempSensor->setRawValue(850);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85.0 degC should be Yellow";
+
+    soc.tempSensor->setRawValue(1050);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105.0 degC should be Red (critical high)";
+
+    // Boundary at CRIT_LO: exactly 5.0 degC (50 deci-degC) -> Green, not Red
+    soc.tempSensor->setRawValue(50);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "5.0 degC (CRIT_LO boundary) should be Green";
+
+    // Below CRIT_LO: 4.9 degC -> Red
+    soc.tempSensor->setRawValue(49);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4.9 degC should be Red (critical low)";
+
+    // Just below CRIT_HI: 104.9 degC (1049 deci-degC) -> Yellow, not Red
+    soc.tempSensor->setRawValue(1049);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "104.9 degC (below CRIT_HI) should be Yellow";
+}
+
+TEST_F(ThermalMonitorTest, SensorI2cError) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeA_1_Per_Unit));
+
+    soc.tempSensor->setRawValue(80);
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "80 degC should be Green";
+
+    soc.tempSensor->injectError(true);
+
+    bool sawRedOn = false, sawRedOff = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (soc.gpioRed->getValue() == 1) sawRedOn  = true;
+        if (soc.gpioRed->getValue() == 0) sawRedOff = true;
+        if (sawRedOn && sawRedOff) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    EXPECT_EQ(soc.gpioGreen->getValue(),  0) << "Green must be off in error";
+    EXPECT_EQ(soc.gpioYellow->getValue(), 0) << "Yellow must be off in error";
+    EXPECT_TRUE(sawRedOn  ) << "Red must turn on during blink";
+    EXPECT_TRUE(sawRedOff ) << "Red must turn off during blink";
+
+    soc.tempSensor->injectError(false);
+    soc.tempSensor->setRawValue(80);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "Recovery should be Green";
+}
+
+TEST_F(ThermalMonitorTest, SensorTypeReadOnceAtStart) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeB_0_1_Per_Unit));
+    soc.tempSensor->setRawValue(900);
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "TypeB raw 900 (90.0 degC) -> Yellow";
+
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeA_1_Per_Unit));
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "EEPROM change after start must be ignored";
+}
+
+TEST_F(ThermalMonitorTest, TemperatureCallback) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeA_1_Per_Unit));
+    soc.tempSensor->setRawValue(25);
+
+    std::atomic<int16_t> captured{-999};
+    monitor->setOnTemperatureCallback([&](int16_t t) { captured = t; });
+
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+
+    EXPECT_EQ(captured.load(), 250) << "25 degC TypeA -> 250 deci-degC";
+}
+
+TEST_F(ThermalMonitorTest, MedianFilterSuppressesOutlier) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeA_1_Per_Unit));
+    monitor->setStabilityConfig(ThermalStabilityConfig{
+        3,
+        std::chrono::milliseconds{1},
+        0
+    });
+
+    soc.tempSensor->setRawSequence({84, 130, 84});
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(std::chrono::milliseconds{40});
+
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "median(84, 130, 84) degC should stay Green";
+}
+
+TEST_F(ThermalMonitorTest, HysteresisUsesConvertedTypeBTemperature) {
+    soc.eepromFile->setByte(0, static_cast<uint8_t>(SensorType::TypeB_0_1_Per_Unit));
+    monitor->setStabilityConfig(ThermalStabilityConfig{
+        1,
+        std::chrono::milliseconds{0},
+        20
+    });
+
+    soc.tempSensor->setRawValue(850);
+    ASSERT_TRUE(monitor->start());
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "85.0 degC enters Yellow";
+
+    soc.tempSensor->setRawValue(840);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "84.0 degC remains Yellow with 2.0 degC hysteresis";
+
+    soc.tempSensor->setRawValue(829);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "82.9 degC exits Yellow";
+
+    soc.tempSensor->setRawValue(1050);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "105.0 degC enters Red high";
+
+    soc.tempSensor->setRawValue(1040);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "104.0 degC remains Red high";
+
+    soc.tempSensor->setRawValue(1029);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, true, false)) << "102.9 degC exits Red high to Yellow";
+
+    soc.tempSensor->setRawValue(49);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "4.9 degC enters Red low";
+
+    soc.tempSensor->setRawValue(60);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(false, false, true)) << "6.0 degC remains Red low with 2.0 degC hysteresis";
+
+    soc.tempSensor->setRawValue(70);
+    std::this_thread::sleep_for(SETTLE);
+    EXPECT_TRUE(checkLEDs(true, false, false)) << "7.0 degC exits Red low";
+}
+
+TEST_F(ThermalMonitorTest, StartStop) {
+    EXPECT_FALSE(monitor->isRunning());
+    ASSERT_TRUE(monitor->start());
+    EXPECT_TRUE(monitor->isRunning());
+    monitor->stop();
+    EXPECT_FALSE(monitor->isRunning());
+}
+
+TEST(ThermalMonitorEepromTest, EepromMissingAtStart) {
+    MockLinuxOs os;
+    MockI2cBus  bus;
+    auto sensor = std::make_shared<MockTempSensorPeripheral>();
+    sensor->setRawValue(25);
+    bus.attach(0x48, sensor);
+    os.registerPath("/dev/i2c-1", std::make_shared<MockI2cDevFile>(bus));
+
+    auto gpioGreen  = std::make_shared<MockGpioValueFile>();
+    auto gpioYellow = std::make_shared<MockGpioValueFile>();
+    auto gpioRed    = std::make_shared<MockGpioValueFile>();
+    os.registerPath("/sys/class/gpio/gpio10/value", gpioGreen);
+    os.registerPath("/sys/class/gpio/gpio11/value", gpioYellow);
+    os.registerPath("/sys/class/gpio/gpio12/value", gpioRed);
+
+    ThermalMonitor monitor(os, std::chrono::milliseconds{10});
+    ASSERT_TRUE(monitor.start());
+
+    bool sawOn = false, sawOff = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (gpioRed->getValue() == 1) sawOn  = true;
+        if (gpioRed->getValue() == 0) sawOff = true;
+        if (sawOn && sawOff) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    EXPECT_EQ(gpioGreen->getValue(),  0) << "Green must be off";
+    EXPECT_EQ(gpioYellow->getValue(), 0) << "Yellow must be off";
+    EXPECT_TRUE(sawOn  ) << "Red must blink on";
+    EXPECT_TRUE(sawOff ) << "Red must blink off";
+
+    monitor.stop();
+}
+
+
+====================================================================================================
+FILE: thermal_monitor.cpp
+====================================================================================================
+
+#include "thermal_monitor.h"
+#include "platform/i2c/i2c_types.hpp"
+
+#include <thread>
+#include <chrono>
+#include <algorithm>
+#include <cassert>
+
+ThermalMonitor::ThermalMonitor(ILinuxLikeOs& os,
+                               std::chrono::milliseconds pollInterval)
+    : os_(os), pollInterval_(pollInterval) {}
+
+ThermalMonitor::~ThermalMonitor() { stop(); }
+
+void ThermalMonitor::setOnTemperatureCallback(TemperatureCallback cb) {
+    std::lock_guard lock(callbackMutex_);
+    tempCallback_ = std::move(cb);
+}
+
+void ThermalMonitor::setStabilityConfig(ThermalStabilityConfig config) {
+    if (config.sampleCount == 0) config.sampleCount = 1;
+    if (config.sampleCount > MAX_FILTER_SAMPLES) config.sampleCount = MAX_FILTER_SAMPLES;
+    if (config.hysteresisDeciCelsius < 0) config.hysteresisDeciCelsius = 0;
+    stability_ = config;
+}
+
+bool ThermalMonitor::start(TemperatureCallback cb) {
+    if (running_.exchange(true)) return true;
+
+    if (cb) {
+        std::lock_guard lock(callbackMutex_);
+        tempCallback_ = std::move(cb);
+    }
+
+    i2cFd_ = os_.open("/dev/i2c-1", OpenFlags::ReadWrite);
+    if (i2cFd_ < 0) {
+        running_.store(false);
+        return false;
+    }
+
+    setupGpios();
+    thread_ = std::thread([this] { pollingLoop(); });
+    return true;
+}
+
+void ThermalMonitor::setupGpios() {
+    struct { const char* num; const char* dir; } gpios[] = {
+        { "10\n", GPIO_GREEN_DIR  },
+        { "11\n", GPIO_YELLOW_DIR },
+        { "12\n", GPIO_RED_DIR    },
+    };
+    for (auto& g : gpios) {
+        Fd fd = os_.open(GPIO_EXPORT, OpenFlags::WriteOnly);
+        if (fd >= 0) { os_.write(fd, g.num, 3); os_.close(fd); }
+        fd = os_.open(g.dir, OpenFlags::WriteOnly);
+        if (fd >= 0) { os_.write(fd, "out\n", 4); os_.close(fd); }
+    }
+}
+
+void ThermalMonitor::stop() {
+    if (!running_.exchange(false)) return;
+    if (thread_.joinable()) thread_.join();
+    os_.close(i2cFd_);
+    i2cFd_ = -1;
+}
+
+void ThermalMonitor::writeGpio(const char* path, bool on) {
+    Fd fd = os_.open(path, OpenFlags::WriteOnly);
+    if (fd >= 0) {
+        const char v[2] = { on ? '1' : '0', '\n' };
+        os_.write(fd, v, 2);
+        os_.close(fd);
+    }
+}
+
+void ThermalMonitor::setGpioLEDs(bool green, bool yellow, bool red) {
+    writeGpio(GPIO_GREEN,  green);
+    writeGpio(GPIO_YELLOW, yellow);
+    writeGpio(GPIO_RED,    red);
+}
+
+void ThermalMonitor::pollingLoop() {
+    const auto typeOpt = readSensorType();
+
+    while (running_.load()) {
+        const auto loopStart = std::chrono::steady_clock::now();
+
+        if (!typeOpt.has_value()) {
+            setErrorState();
+        } else {
+            auto temp = readFilteredTemperature(typeOpt.value());
+            if (!temp.has_value()) {
+                setErrorState();
+            } else {
+                int16_t temp_dC = temp.value();
+                evaluateAndUpdate(temp_dC);
+                TemperatureCallback cb;
+                { std::lock_guard lock(callbackMutex_); cb = tempCallback_; }
+                if (cb) cb(temp_dC);
+            }
+        }
+
+        const auto elapsed = std::chrono::steady_clock::now() - loopStart;
+        if (elapsed < pollInterval_)
+            std::this_thread::sleep_for(pollInterval_ - elapsed);
+    }
+}
+
+std::optional<SensorType> ThermalMonitor::readSensorType() {
+    Fd fd = os_.open("/sys/bus/nvmem/devices/eeprom0/nvmem", OpenFlags::ReadOnly);
+    if (fd < 0) return std::nullopt;
+
+    os_.lseek(fd, 0, Seek_Set);
+    uint8_t byte = 0;
+    ssize_t n = os_.read(fd, &byte, 1);
+    os_.close(fd);
+
+    if (n < 1) return std::nullopt;
+
+    return (byte == static_cast<uint8_t>(SensorType::TypeB_0_1_Per_Unit))
+        ? SensorType::TypeB_0_1_Per_Unit
+        : SensorType::TypeA_1_Per_Unit;
+}
+
+std::optional<int16_t> ThermalMonitor::readRawFromI2c() {
+    uint8_t regAddr = TEMP_REG;
+    uint8_t buf[2]  = {};
+
+    i2c_msg msgs[2] = {
+        { SENSOR_ADDR, 0,        1, &regAddr },
+        { SENSOR_ADDR, I2C_M_RD, 2, buf      },
+    };
+    i2c_rdwr_data data = { msgs, 2 };
+
+    if (os_.ioctl(i2cFd_, I2C_RDWR, &data) >= 0)
+        return static_cast<int16_t>((buf[0] << 8) | buf[1]);
+
+    // Linux i2c-stub exposes SMBus operations but not full I2C_RDWR transfers.
+    if (os_.ioctl(i2cFd_, I2C_SLAVE, reinterpret_cast<void*>(static_cast<uintptr_t>(SENSOR_ADDR))) < 0)
+        return std::nullopt;
+
+    i2c_smbus_data smbusData{};
+    i2c_smbus_ioctl_data smbusArgs{
+        I2C_SMBUS_READ,
+        TEMP_REG,
+        I2C_SMBUS_WORD_DATA,
+        &smbusData
+    };
+
+    if (os_.ioctl(i2cFd_, I2C_SMBUS, &smbusArgs) < 0)
+        return std::nullopt;
+
+    return static_cast<int16_t>(smbusData.word);
+}
+
+int16_t ThermalMonitor::convertToDeciCelsius(int16_t raw, SensorType type) {
+    if (type == SensorType::TypeA_1_Per_Unit) return raw * 10;
+    return raw;
+}
+
+std::optional<int16_t> ThermalMonitor::readFilteredTemperature(SensorType type) {
+    int16_t values[MAX_FILTER_SAMPLES]{};
+    const size_t count = std::max<size_t>(1, std::min<size_t>(stability_.sampleCount, MAX_FILTER_SAMPLES));
+
+    for (size_t i = 0; i < count; ++i) {
+        auto raw = readRawFromI2c();
+        if (!raw.has_value()) return std::nullopt;
+        values[i] = convertToDeciCelsius(raw.value(), type);
+
+        if (i + 1 < count && stability_.sampleSpacing.count() > 0) {
+            const auto until = std::chrono::steady_clock::now() + stability_.sampleSpacing;
+            while (running_.load() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            if (!running_.load()) return std::nullopt;
+        }
+    }
+
+    return median(values, count);
+}
+
+int16_t ThermalMonitor::median(int16_t* values, size_t count) {
+    std::sort(values, values + count);
+    for (size_t i = 1; i < count; ++i) {
+        assert(values[i - 1] <= values[i]);
+    }
+    return values[count / 2];
+}
+
+void ThermalMonitor::evaluateAndUpdate(int16_t temp_dC) {
+    ledState_ = classify(temp_dC);
+    applyLedState(ledState_);
+}
+
+ThermalMonitor::LedState ThermalMonitor::classify(int16_t temp_dC) const {
+    const int16_t h = stability_.hysteresisDeciCelsius;
+
+    switch (ledState_) {
+        case LedState::RedHigh:
+            if (temp_dC >= static_cast<int16_t>(CRIT_HI - h)) return LedState::RedHigh;
+            break;
+        case LedState::RedLow:
+            if (temp_dC < static_cast<int16_t>(CRIT_LO + h)) return LedState::RedLow;
+            break;
+        case LedState::Yellow:
+            if (temp_dC >= static_cast<int16_t>(WARN - h) && temp_dC < CRIT_HI) return LedState::Yellow;
+            break;
+        case LedState::Green:
+            break;
+    }
+
+    if (temp_dC >= CRIT_HI) return LedState::RedHigh;
+    if (temp_dC < CRIT_LO) return LedState::RedLow;
+    if (temp_dC >= WARN) return LedState::Yellow;
+    return LedState::Green;
+}
+
+void ThermalMonitor::applyLedState(LedState state) {
+    switch (state) {
+        case LedState::Green:
+            setGpioLEDs(true, false, false);
+            break;
+        case LedState::Yellow:
+            setGpioLEDs(false, true, false);
+            break;
+        case LedState::RedLow:
+        case LedState::RedHigh:
+            setGpioLEDs(false, false, true);
+            break;
+    }
+}
+
+void ThermalMonitor::setErrorState() {
+    errorBlink_ = !errorBlink_;
+    setGpioLEDs(false, false, errorBlink_);
+    TemperatureCallback cb;
+    { std::lock_guard lock(callbackMutex_); cb = tempCallback_; }
+    if (cb) cb(-9999);
+}
+
+
+====================================================================================================
+FILE: thermal_monitor.h
+====================================================================================================
+
+#pragma once
+
+#include "interfaces.h"
+#include "platform/linux_like_os.hpp"
+
+#include <atomic>
+#include <optional>
+#include <chrono>
+#include <functional>
+#include <cstdint>
+#include <mutex>
+#include <thread>
+
+constexpr int16_t CRIT_LO = 50;
+constexpr int16_t WARN    = 850;
+constexpr int16_t CRIT_HI = 1050;
+
+struct ThermalStabilityConfig {
+    uint8_t sampleCount = 1;
+    std::chrono::milliseconds sampleSpacing{0};
+    int16_t hysteresisDeciCelsius = 0;
+};
+
+class ThermalMonitor {
+public:
+    using TemperatureCallback = std::function<void(int16_t tempDeciCelsius)>;
+
+    ThermalMonitor(ILinuxLikeOs& os,
+                   std::chrono::milliseconds pollInterval = std::chrono::milliseconds{100});
+    ~ThermalMonitor();
+
+    bool start(TemperatureCallback cb = nullptr);
+    void stop();
+    bool isRunning() const { return running_.load(); }
+
+    void setOnTemperatureCallback(TemperatureCallback cb);
+    void setStabilityConfig(ThermalStabilityConfig config);
+
+private:
+    enum class LedState { Green, Yellow, RedLow, RedHigh };
+
+    void pollingLoop();
+
+    std::optional<SensorType>  readSensorType();
+    std::optional<int16_t>     readRawFromI2c();
+    std::optional<int16_t>     readFilteredTemperature(SensorType type);
+    int16_t                    convertToDeciCelsius(int16_t raw, SensorType type);
+    int16_t                    median(int16_t* values, size_t count);
+    void                       evaluateAndUpdate(int16_t temp_dC);
+    LedState                   classify(int16_t temp_dC) const;
+    void                       applyLedState(LedState state);
+    void                       setErrorState();
+    void                       setupGpios();
+    void                       writeGpio(const char* path, bool on);
+    void                       setGpioLEDs(bool green, bool yellow, bool red);
+
+    ILinuxLikeOs& os_;
+    std::chrono::milliseconds pollInterval_;
+
+    std::thread         thread_;
+    std::atomic<bool>   running_{false};
+    TemperatureCallback tempCallback_;
+    mutable std::mutex  callbackMutex_;
+
+    Fd   i2cFd_      = -1;
+    bool errorBlink_ = false;
+    LedState ledState_ = LedState::Green;
+    ThermalStabilityConfig stability_;
+
+    static constexpr uint16_t    SENSOR_ADDR = 0x48;
+    static constexpr uint8_t     TEMP_REG    = 0x00;
+    static constexpr size_t      MAX_FILTER_SAMPLES = 9;
+    static constexpr const char* GPIO_EXPORT     = "/sys/class/gpio/export";
+    static constexpr const char* GPIO_GREEN      = "/sys/class/gpio/gpio10/value";
+    static constexpr const char* GPIO_YELLOW     = "/sys/class/gpio/gpio11/value";
+    static constexpr const char* GPIO_RED        = "/sys/class/gpio/gpio12/value";
+    static constexpr const char* GPIO_GREEN_DIR  = "/sys/class/gpio/gpio10/direction";
+    static constexpr const char* GPIO_YELLOW_DIR = "/sys/class/gpio/gpio11/direction";
+    static constexpr const char* GPIO_RED_DIR    = "/sys/class/gpio/gpio12/direction";
+};
+
+
+====================================================================================================
+FILE: tools/gpio_sysfs_mock/Makefile
+====================================================================================================
+
+obj-m += thermal_gpio_mock.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+
+====================================================================================================
+FILE: tools/gpio_sysfs_mock/thermal_gpio_mock.c
+====================================================================================================
+
+#include <linux/gpio/driver.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+
+#define THERMAL_GPIO_BASE 10
+#define THERMAL_GPIO_COUNT 3
+
+static DEFINE_MUTEX(values_lock);
+static unsigned long values;
+
+static int thermal_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
+{
+    return GPIO_LINE_DIRECTION_OUT;
+}
+
+static int thermal_gpio_direction_output(struct gpio_chip *chip,
+                                         unsigned int offset,
+                                         int value)
+{
+    mutex_lock(&values_lock);
+    if (value)
+        __set_bit(offset, &values);
+    else
+        __clear_bit(offset, &values);
+    mutex_unlock(&values_lock);
+    return 0;
+}
+
+static void thermal_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+{
+    mutex_lock(&values_lock);
+    if (value)
+        __set_bit(offset, &values);
+    else
+        __clear_bit(offset, &values);
+    mutex_unlock(&values_lock);
+}
+
+static int thermal_gpio_get(struct gpio_chip *chip, unsigned int offset)
+{
+    int value;
+
+    mutex_lock(&values_lock);
+    value = test_bit(offset, &values) ? 1 : 0;
+    mutex_unlock(&values_lock);
+    return value;
+}
+
+static struct gpio_chip thermal_gpio_chip = {
+    .label = "thermal-gpio-mock",
+    .base = THERMAL_GPIO_BASE,
+    .ngpio = THERMAL_GPIO_COUNT,
+    .can_sleep = false,
+    .get_direction = thermal_gpio_get_direction,
+    .direction_output = thermal_gpio_direction_output,
+    .set = thermal_gpio_set,
+    .get = thermal_gpio_get,
+};
+
+static int __init thermal_gpio_mock_init(void)
+{
+    return gpiochip_add_data(&thermal_gpio_chip, NULL);
+}
+
+static void __exit thermal_gpio_mock_exit(void)
+{
+    gpiochip_remove(&thermal_gpio_chip);
+}
+
+module_init(thermal_gpio_mock_init);
+module_exit(thermal_gpio_mock_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ThermalMonitor integration test");
+MODULE_DESCRIPTION("GPIO sysfs mock chip for ThermalMonitor integration tests");
+
+

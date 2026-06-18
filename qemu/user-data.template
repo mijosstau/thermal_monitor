@@ -1,0 +1,24 @@
+#cloud-config
+users:
+  - name: dev
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+    lock_passwd: true
+ssh_pwauth: false
+package_update: true
+packages:
+  - build-essential
+  - cmake
+  - git
+  - rsync
+  - pkg-config
+  - qt6-base-dev
+  - libgtest-dev
+  - linux-image-amd64
+  - linux-headers-amd64
+runcmd:
+  - [ bash, -lc, "apt-get install -y linux-headers-$(uname -r) || true" ]
+  - [ bash, -lc, "modprobe i2c-dev || true" ]
+final_message: "embedded-demo cloud-init setup complete"

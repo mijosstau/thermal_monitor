@@ -1,0 +1,8 @@
+*.qcow2
+*.img
+*.iso
+*.log
+vm_key
+vm_key.pub
+user-data
+known_hosts

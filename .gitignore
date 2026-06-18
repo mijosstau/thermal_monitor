@@ -1,0 +1,17 @@
+build/
+CMakeLists.txt.user
+*.user
+*.log
+__pycache__/
+*.pyc
+.claude/
+
+# QEMU generated artifacts
+qemu/*.qcow2
+qemu/*.img
+qemu/*.iso
+qemu/*.log
+qemu/vm_key
+qemu/vm_key.pub
+qemu/user-data
+qemu/known_hosts
