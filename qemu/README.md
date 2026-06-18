@@ -18,6 +18,9 @@ Install host tools:
 sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client
 ```
 
+The VM is an x86_64 Debian VM and requires `qemu-system-x86_64`. On
+Debian/Ubuntu this binary is provided by the `qemu-system-x86` package.
+
 Then create the VM image:
 
 ```bash

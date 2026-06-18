@@ -10,6 +10,9 @@ Generated PDF documentation: [docs/README.pdf](docs/README.pdf)
 
 QEMU VM setup: [qemu/README.md](qemu/README.md)
 
+QEMU integration tests require an x86_64 QEMU binary. On Debian/Ubuntu,
+install `qemu-system-x86`, which provides `qemu-system-x86_64`.
+
 ## Quick Start
 
 ```bash

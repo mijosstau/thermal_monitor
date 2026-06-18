@@ -160,6 +160,9 @@ The simulator uses mock sensor/config/GPIO backends. It does not require real ha
 
 ## QEMU Hardware Integration Test
 
+The QEMU integration test requires an x86_64 QEMU binary. On Debian/Ubuntu,
+install `qemu-system-x86`, which provides `qemu-system-x86_64`.
+
 The automated QEMU test is:
 
 ```bash
