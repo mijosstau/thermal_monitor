@@ -10,6 +10,29 @@ The project also contains a Qt simulator, unit tests, Linux hardware adapters, a
 
 Architecture diagram: [architecture.svg](architecture.svg)
 
+## Prerequisites
+
+On Debian/Ubuntu, install the build dependencies:
+
+```bash
+sudo apt update
+sudo apt install git ca-certificates build-essential cmake libgtest-dev qtbase5-dev qt5-qmake
+```
+
+The Qt simulator requires Qt development files. This project can use Qt 6 when
+available and falls back to Qt 5. On Ubuntu 24.04, `qt5-default` is no longer
+available; use `qtbase5-dev` and `qt5-qmake`, or install the Qt 6 development
+package instead.
+
+For QEMU hardware integration tests, install the host tools:
+
+```bash
+sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client rsync
+```
+
+The QEMU integration test requires an x86_64 QEMU binary. On Debian/Ubuntu,
+`qemu-system-x86` provides `qemu-system-x86_64`.
+
 ## Behavior
 
 All temperatures are evaluated internally in deci-Celsius.
@@ -264,3 +287,14 @@ sudo ./build/c_impl/thermal_monitor_c_demo_real
 - GPIO sysfs is deprecated in modern Linux, but it is used here because the monitor requirements and existing code target `/sys/class/gpio`.
 - The C core stays hardware-neutral; platform-specific behavior belongs in adapters.
 - The C++ core stays syscall-neutral through `ILinuxLikeOs`.
+
+## Production Release Limitations
+
+This project is an embedded-style demo and test exercise, not a complete
+production release. A production version should address these points:
+
+- Add an external watchdog or supervisor that detects if the thermal monitor process or worker thread crashes and restarts or escalates safely.
+- Add detailed structured error logging for I2C, NVMEM, GPIO, startup, shutdown, and callback failures.
+- Extend the tests with real hardware-failure coverage, for example sensor disconnects, stuck bus behavior, GPIO export/write failures, corrupted NVMEM data, and permission errors.
+- Replace fixed constants and magic numbers such as device paths, I2C address, GPIO numbers, thresholds, and timing values with validated configuration files or deployment configuration.
+- Define behavior for live hardware swap or hotplug events. The current implementation assumes the sensor, NVMEM source, and GPIO interface remain stable while the monitor is running.

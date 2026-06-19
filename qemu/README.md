@@ -15,7 +15,7 @@ Large generated VM artifacts are intentionally not committed:
 Install host tools:
 
 ```bash
-sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client
+sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client rsync
 ```
 
 The VM is an x86_64 Debian VM and requires `qemu-system-x86_64`. On
